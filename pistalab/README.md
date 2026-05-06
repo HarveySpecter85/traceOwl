@@ -19,7 +19,8 @@ It is designed for:
 - draft-only tip packets for human review,
 - optional Sherlock username-correlation planning for officially published aliases,
 - court-record deepening for public/official docket context,
-- public docket/case-number candidate finding without PACER/private access.
+- public docket/case-number candidate finding without PACER/private access,
+- public-record source routing with explicit ready/blocked states.
 
 ## What this is not
 

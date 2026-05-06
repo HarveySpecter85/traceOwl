@@ -1861,6 +1861,141 @@ def cmd_docket_find(args: argparse.Namespace) -> None:
         "external_actions_performed": False,
     }, indent=2, ensure_ascii=False))
 
+
+def public_record_routes(case: dict[str, Any], clues: dict[str, Any]) -> list[dict[str, Any]]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    q_name = urllib.parse.quote(f'"{name}"')
+    official_url = case.get("source", {}).get("official_url", "")
+    routes: list[dict[str, Any]] = []
+    def add(source_id: str, label: str, url: str, purpose: str, access: str, status: str, priority: int, notes: str = "", allowed: bool = True):
+        routes.append({
+            "source_id": source_id,
+            "label": label,
+            "url": url,
+            "purpose": purpose,
+            "access": access,
+            "status": status,
+            "priority": priority,
+            "allowed": allowed,
+            "notes": notes,
+            "blocked_paths": [
+                "No private login/PACER credentials in this router",
+                "No paid/private databases",
+                "No sealed filings",
+                "No contact with people/entities",
+                "No external tip submission",
+            ],
+        })
+    if official_url:
+        add("state-official-notice", "State Department official notice", official_url, "Canonical reward notice / official details", "public_web", "ready", 100)
+    add("state-search", "State.gov search", f"https://www.state.gov/?s={urllib.parse.quote(name)}", "Official State Department related pages", "public_web", "ready", 95)
+    add("justice-search", "Justice.gov search", f"https://www.justice.gov/search?keys={urllib.parse.quote(name)}", "DOJ press releases and official case context", "public_web", "ready", 92)
+    add("justice-cdca", "DOJ CDCA page search", f"https://www.justice.gov/usao-cdca/search?search_api_fulltext={urllib.parse.quote(name)}", "Central District of California official releases", "public_web", "ready", 90)
+    add("secretservice-search", "SecretService.gov search", f"https://www.secretservice.gov/search?search={urllib.parse.quote(name)}", "USSS public mentions / wanted references", "public_web", "ready", 84)
+    add("cacd-site", "CDCA court site search", f"https://www.cacd.uscourts.gov/search/node/{urllib.parse.quote(name)}", "Official court website references", "public_web", "ready", 82)
+    add("govinfo-search", "GovInfo search", f"https://www.govinfo.gov/app/search/%7B%22query%22%3A%22{q_name}%22%7D", "Official public government records/opinions", "public_web", "ready", 78)
+    add("courtlistener-web", "CourtListener public web search", f"https://www.courtlistener.com/?q={q_name}", "Public docket/opinion/RECAP search via website", "public_web", "ready", 76, "Use public web only unless API token is configured.")
+    add("courtlistener-api", "CourtListener API", f"https://www.courtlistener.com/api/rest/v3/search/?q={q_name}", "Structured public court search API", "api", "blocked_requires_api_token", 70, "Anonymous API returned 403 in prior test; use only with lawful API token and rate limits.", allowed=False)
+    add("recap-storage", "RECAP storage targeted search", f"https://www.google.com/search?q={urllib.parse.quote(name + ' site:storage.courtlistener.com')}", "Public RECAP document mirror discovery", "public_search", "ready", 68)
+    add("internet-archive", "Internet Archive web search", f"https://archive.org/search?query={urllib.parse.quote(name)}", "Historical public captures / documents", "public_web", "ready", 55)
+    add("pacer-private", "PACER private access", "https://pacer.uscourts.gov/", "Federal docket access", "private_or_paid", "blocked_private_or_paid", 0, "Blocked in PistaLab. Requires human/legal decision outside this worker.", allowed=False)
+    routes.sort(key=lambda r: r["priority"], reverse=True)
+    return routes
+
+
+def probe_public_route(route: dict[str, Any], timeout: int = 12) -> dict[str, Any]:
+    if not route.get("allowed") or route.get("status", "").startswith("blocked"):
+        return {"probed": False, "reason": route.get("status"), "external_actions_performed": False}
+    url = route.get("url", "")
+    if not url.startswith(("http://", "https://")):
+        return {"probed": False, "reason": "unsupported_url", "external_actions_performed": False}
+    # Avoid probing Google result pages from this worker; they are route pointers, not evidence.
+    if "google.com/search" in url:
+        return {"probed": False, "reason": "search_pointer_not_probed", "external_actions_performed": False}
+    try:
+        status, content_type, raw = fetch_public_url(url, timeout=timeout)
+        text = strip_html(raw)[:1200]
+        return {
+            "probed": True,
+            "http_status": status,
+            "content_type": content_type,
+            "excerpt_sha256": sha256_text(text),
+            "excerpt_preview": redact_sensitive_lines(text[:400]),
+            "external_actions_performed": False,
+        }
+    except Exception as exc:
+        return {"probed": True, "error": str(exc)[:300], "external_actions_performed": False}
+
+
+def cmd_source_router(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    ledger_path = Path(args.ledger) if args.ledger else EVIDENCE / case_id / "captures" / "evidence-ledger.jsonl"
+    ledger_rows = read_jsonl(ledger_path)
+    clues = extract_court_clues(case, ledger_rows)
+    routes = public_record_routes(case, clues)
+    if args.ready_only:
+        routes = [r for r in routes if r.get("allowed") and r.get("status") == "ready"]
+    if args.limit:
+        routes = routes[: args.limit]
+    probes = []
+    if args.probe:
+        for route in routes[: args.probe_limit]:
+            probe = probe_public_route(route)
+            route["probe"] = probe
+            probes.append({"source_id": route["source_id"], **probe})
+            time.sleep(args.delay)
+    outdir = OUTPUTS / case_id / "source-router"
+    outdir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "route_count": len(routes),
+        "ready_count": sum(1 for r in routes if r.get("allowed") and r.get("status") == "ready"),
+        "blocked_count": sum(1 for r in routes if not r.get("allowed") or str(r.get("status", "")).startswith("blocked")),
+        "routes": routes,
+        "probes": probes,
+        "external_actions_performed": False,
+        "policy": "Public records routing only. No private/paid/sealed access and no contact/submission.",
+    }
+    write_json(outdir / "public-records-source-router.json", payload)
+    lines = [
+        f"# Public Records Source Router — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Routes: {payload['route_count']}",
+        f"- Ready: {payload['ready_count']}",
+        f"- Blocked: {payload['blocked_count']}",
+        f"- External actions performed: false", "",
+        "## Routes", "",
+    ]
+    for r in routes:
+        mark = "READY" if r.get("allowed") and r.get("status") == "ready" else "BLOCKED"
+        lines += [
+            f"### {r['priority']} — {mark} — {r['label']}",
+            f"- ID: `{r['source_id']}`",
+            f"- URL: {r['url']}",
+            f"- Purpose: {r['purpose']}",
+            f"- Access: {r['access']}",
+            f"- Status: {r['status']}",
+            f"- Notes: {r.get('notes') or 'none'}",
+        ]
+        if r.get("probe"):
+            lines.append(f"- Probe: `{json.dumps(r['probe'], ensure_ascii=False)[:500]}`")
+        lines.append("")
+    (outdir / "public-records-source-router.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("source_router", {})["latest"] = str((outdir / "public-records-source-router.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "routes": payload["route_count"],
+        "ready": payload["ready_count"],
+        "blocked": payload["blocked_count"],
+        "probed": len(probes),
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+    }, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -2016,6 +2151,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold", type=int, default=75)
     p.add_argument("--report-limit", type=int, default=10)
     p.set_defaults(func=cmd_docket_find)
+
+    p = sub.add_parser("source-router", help="Route case to public record sources and flag blocked/private sources")
+    p.add_argument("case")
+    p.add_argument("--ledger", default="")
+    p.add_argument("--ready-only", action="store_true")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--probe", action="store_true", help="Probe ready public URLs only; no private/paid/sealed access")
+    p.add_argument("--probe-limit", type=int, default=5)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.set_defaults(func=cmd_source_router)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
