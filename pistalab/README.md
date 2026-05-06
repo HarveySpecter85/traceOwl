@@ -22,7 +22,8 @@ It is designed for:
 - public docket/case-number candidate finding without PACER/private access,
 - public-record source routing with explicit ready/blocked states,
 - gated Sherlock execution for weak username-correlation evidence,
-- Sherlock result triage and search-snippet corroboration.
+- Sherlock result triage and search-snippet corroboration,
+- public/official camera-source routing and snippet-only search with unsafe camera discovery blocked.
 
 ## What this is not
 

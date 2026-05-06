@@ -2392,6 +2392,258 @@ def cmd_sherlock_corroborate(args: argparse.Namespace) -> None:
         "external_actions_performed": False,
     }, indent=2, ensure_ascii=False))
 
+
+CAMERA_ALLOWED_SOURCE_TYPES = {
+    "official_traffic_camera",
+    "official_municipal_webcam",
+    "official_airport_port_webcam",
+    "public_media_livecam",
+    "public_webcam_directory",
+}
+
+CAMERA_BLOCKED_SOURCE_TYPES = {
+    "open_ip_camera",
+    "misconfigured_private_camera",
+    "residential_camera",
+    "workplace_security_camera",
+    "shodan_censys_insecam",
+    "face_recognition",
+    "private_cctv_request",
+}
+
+
+def case_camera_terms(case: dict[str, Any]) -> dict[str, Any]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    aliases = [a for a in (entity.get("aliases") or []) if a and len(a) > 3]
+    source_parts = [json.dumps(case, ensure_ascii=False)]
+    case_id = case.get("case_id", "")
+    if case_id:
+        evidence_root = EVIDENCE / case_id
+        if evidence_root.exists():
+            for fp in evidence_root.rglob("*.jsonl"):
+                try:
+                    source_parts.append(fp.read_text(errors="ignore")[:50000])
+                except Exception:
+                    pass
+    source_text = "\n".join(source_parts)
+    candidate_terms = [
+        "Central District of California", "Los Angeles", "California", "Cambodia", "Kingdom of Cambodia",
+        "China", "St. Kitts and Nevis", "Dominican Republic", "United States", "El Camino Real",
+    ]
+    anchors = []
+    for term in candidate_terms:
+        if re.search(re.escape(term), source_text, re.I):
+            anchors.append(term)
+    return {"name": name, "aliases": aliases, "anchors": sorted(set(anchors))}
+
+
+def public_camera_routes(case: dict[str, Any]) -> list[dict[str, Any]]:
+    terms = case_camera_terms(case)
+    anchors = terms["anchors"] or ["case location unknown"]
+    routes: list[dict[str, Any]] = []
+    def add(source_id: str, label: str, source_type: str, url: str, purpose: str, status: str, priority: int, notes: str = "", allowed: bool = True):
+        routes.append({
+            "source_id": source_id,
+            "label": label,
+            "source_type": source_type,
+            "url": url,
+            "purpose": purpose,
+            "status": status,
+            "priority": priority,
+            "allowed": allowed,
+            "notes": notes,
+            "anchors": anchors,
+            "blocked_paths": [
+                "No hacked/misconfigured/open IP cameras",
+                "No Shodan/Censys/Insecam-style discovery",
+                "No residential/workplace/private CCTV",
+                "No face recognition or biometric matching",
+                "No tracking a person across cameras",
+                "No contacting camera owners/operators",
+                "No tip submission from camera-source leads alone",
+            ],
+        })
+    add("official-dot-traffic", "Official DOT/traffic camera maps", "official_traffic_camera", "route://official-dot-traffic", "Find public official traffic camera portals for case-relevant locations", "ready_requires_location_anchor", 92, "Use only official DOT/city traffic camera pages.")
+    add("official-airport-port", "Official airport/port webcams", "official_airport_port_webcam", "route://official-airport-port", "Find official airport/port webcams for public transit/location context", "ready_requires_location_anchor", 80)
+    add("official-city-webcams", "Official municipal webcams", "official_municipal_webcam", "route://official-city-webcams", "Find city/county public webcam pages", "ready_requires_location_anchor", 78)
+    add("public-youtube-livecams", "Public YouTube live cameras", "public_media_livecam", "route://youtube-live-public-cams", "Search public livestreams already intentionally published", "ready_public_only", 65, "Do not use face matching or live tracking.")
+    add("public-webcam-directories", "Public webcam directories", "public_webcam_directory", "route://public-webcam-directories", "Search public webcam directories for location context", "ready_public_only", 55, "Use only pages intentionally publishing public views.")
+    add("open-ip-camera-search", "Open IP camera search", "open_ip_camera", "blocked://open-ip-camera-search", "Misconfigured exposed cameras", "blocked_prohibited", 0, "Blocked: open/misconfigured cameras are not consent-based public sources.", allowed=False)
+    add("shodan-censys-insecam", "Shodan/Censys/Insecam camera discovery", "shodan_censys_insecam", "blocked://device-search", "Device discovery for exposed cameras", "blocked_prohibited", 0, "Blocked: do not discover or exploit exposed camera devices.", allowed=False)
+    add("face-recognition", "Face recognition over public camera feeds", "face_recognition", "blocked://face-recognition", "Biometric identification/tracking", "blocked_prohibited", 0, "Blocked: no biometric matching or live tracking.", allowed=False)
+    routes.sort(key=lambda r: r["priority"], reverse=True)
+    return routes
+
+
+def public_camera_queries(case: dict[str, Any], routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    terms = case_camera_terms(case)
+    name = terms["name"]
+    aliases = terms["aliases"]
+    anchors = terms["anchors"] or []
+    queries: list[dict[str, Any]] = []
+    def add(query: str, purpose: str, route_id: str, risk: str = "low", allowed: bool = True):
+        queries.append({"query": query, "purpose": purpose, "route_id": route_id, "risk": risk, "allowed": allowed})
+    # Case-specific snippets: safe, non-invasive public web search only.
+    if name:
+        add(f'"{name}" "camera" "Secret Service"', "Check public reporting mentioning cameras/security footage", "public-media-context")
+        add(f'"{name}" "surveillance camera"', "Check public reporting for surveillance-camera mentions", "public-media-context")
+        add(f'"{name}" "airport" "camera"', "Check public reporting for travel/camera context", "public-media-context")
+    for alias in aliases[:4]:
+        add(f'"{alias}" "webcam"', "Alias + public webcam context", "public-media-context", risk="medium")
+        add(f'"{alias}" "YouTube" "live"', "Alias + public livestream context", "public-youtube-livecams", risk="medium")
+    for anchor in anchors[:5]:
+        add(f'{anchor} official traffic cameras', "Find official traffic camera portal for location anchor", "official-dot-traffic")
+        add(f'{anchor} official public webcams', "Find official municipal/public webcams for location anchor", "official-city-webcams")
+        add(f'{anchor} airport official webcam', "Find official airport webcam for location anchor", "official-airport-port")
+    # Explicit no-go routes retained in report but never executed.
+    add('site:insecam.org camera', "Blocked: exposed camera directory", "shodan-censys-insecam", risk="prohibited", allowed=False)
+    add('intitle:"webcamXP" "admin" camera', "Blocked: misconfigured private cameras", "open-ip-camera-search", risk="prohibited", allowed=False)
+    add(f'"{name}" face recognition public cameras', "Blocked: biometric identification/tracking", "face-recognition", risk="prohibited", allowed=False)
+    return queries
+
+
+def camera_result_score(case: dict[str, Any], result: dict[str, str]) -> dict[str, Any]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    haystack = f"{result.get('title','')} {result.get('snippet','')} {result.get('url','')}"
+    score = 0
+    reasons: list[str] = []
+    if name and re.search(re.escape(name), haystack, re.I):
+        score += 35; reasons.append("primary name match")
+    if re.search(r"camera|webcam|livecam|traffic cam|surveillance|CCTV", haystack, re.I):
+        score += 20; reasons.append("camera terms")
+    if re.search(r"official|department of transportation|DOT|city of|airport|port authority|uscourts|justice.gov|state.gov", haystack, re.I):
+        score += 20; reasons.append("official/public institution terms")
+    domain = source_domain(result.get("url", ""))
+    if domain.endswith(".gov") or domain.endswith(".us") or domain in {"youtube.com", "www.youtube.com"}:
+        score += 15; reasons.append("public/official-ish domain")
+    if re.search(r"insecam|shodan|censys|default password|admin", haystack, re.I):
+        score = 0; reasons.append("blocked exposed-device signal")
+    return {"score": min(score, 100), "reasons": reasons}
+
+
+def cmd_camera_router(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    routes = public_camera_routes(case)
+    queries = public_camera_queries(case, routes)
+    outdir = OUTPUTS / case_id / "camera-router"
+    outdir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "routes": routes,
+        "queries": queries,
+        "ready_count": sum(1 for r in routes if r.get("allowed")),
+        "blocked_count": sum(1 for r in routes if not r.get("allowed")),
+        "allowed_queries": sum(1 for q in queries if q.get("allowed")),
+        "blocked_queries": sum(1 for q in queries if not q.get("allowed")),
+        "external_actions_performed": False,
+        "policy": "Public/official camera-source routing only. No open IP cams, private CCTV, face recognition, contact, or tracking.",
+    }
+    write_json(outdir / "camera-router.json", payload)
+    lines = [
+        f"# Public Camera Source Router — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Ready routes: {payload['ready_count']}",
+        f"- Blocked routes: {payload['blocked_count']}",
+        f"- Allowed queries: {payload['allowed_queries']}",
+        f"- Blocked queries: {payload['blocked_queries']}",
+        "- External actions performed: false", "",
+        "## Routes", "",
+    ]
+    for r in routes:
+        mark = "READY" if r.get("allowed") else "BLOCKED"
+        lines += [f"### {r['priority']} — {mark} — {r['label']}", f"- Type: `{r['source_type']}`", f"- Status: {r['status']}", f"- Purpose: {r['purpose']}", f"- Notes: {r.get('notes') or 'none'}", ""]
+    lines += ["## Queries", ""]
+    for q in queries:
+        mark = "ALLOW" if q.get("allowed") else "BLOCK"
+        lines += [f"- {mark}: `{q['query']}` — {q['purpose']}"]
+    (outdir / "camera-router.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["camera_router"] = str((outdir / "camera-router.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "ready_routes": payload["ready_count"], "blocked_routes": payload["blocked_count"], "allowed_queries": payload["allowed_queries"], "blocked_queries": payload["blocked_queries"], "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
+
+def cmd_camera_search(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    router_path = Path(args.router) if args.router else OUTPUTS / case_id / "camera-router" / "camera-router.json"
+    if not router_path.exists():
+        cmd_camera_router(argparse.Namespace(case=args.case))
+    router = read_json(router_path)
+    queries = [q for q in router.get("queries", []) if q.get("allowed")]
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "camera-search"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "camera-search"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "camera-search-ledger.jsonl"
+    rows: list[dict[str, Any]] = []
+    for q in queries:
+        results = ddg_search(q["query"], limit=args.per_query)
+        if not results:
+            row = {"case_id": case_id, "kind": "camera_search_no_results", **q, "captured_at": now_iso(), "external_actions_performed": False}
+            append_jsonl(ledger, row); rows.append(row)
+        for rank, result in enumerate(results, 1):
+            if result.get("title") == "SEARCH_ERROR":
+                row = {"case_id": case_id, "kind": "camera_search_error", **q, "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False}
+                append_jsonl(ledger, row); rows.append(row); continue
+            scored = camera_result_score(case, result)
+            row = {
+                "case_id": case_id,
+                "kind": "public_camera_search_result",
+                **q,
+                "rank": rank,
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "domain": source_domain(result.get("url", "")),
+                "snippet": redact_sensitive_lines(result.get("snippet", "")),
+                "camera_relevance_score": scored["score"],
+                "camera_relevance_reasons": scored["reasons"],
+                "captured_at": now_iso(),
+                "external_actions_performed": False,
+                "policy": "Search snippets/URLs only. No live camera viewing, no private/open IP cams, no face recognition, no contact.",
+            }
+            append_jsonl(ledger, row); rows.append(row)
+        time.sleep(args.delay)
+    result_rows = [r for r in rows if r.get("kind") == "public_camera_search_result"]
+    result_rows.sort(key=lambda r: r.get("camera_relevance_score", 0), reverse=True)
+    strong = [r for r in result_rows if r.get("camera_relevance_score", 0) >= args.threshold]
+    status = "PUBLIC_CAMERA_LEADS_FOUND_REVIEW_REQUIRED" if strong else ("NO_STRONG_PUBLIC_CAMERA_LEADS" if result_rows else "NO_PUBLIC_CAMERA_RESULTS")
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "queries_run": len(queries),
+        "result_count": len(result_rows),
+        "strong_count": len(strong),
+        "top_results": result_rows[: args.limit],
+        "ledger": str(ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "policy": "Public/official camera-source search only. Results are source leads, not identity evidence.",
+    }
+    write_json(outdir / "camera-search.json", payload)
+    lines = [
+        f"# Public Camera Search — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Status: {status}",
+        f"- Queries run: {len(queries)}",
+        f"- Results: {len(result_rows)}",
+        f"- Strong leads: {len(strong)}",
+        "- External actions performed: false", "",
+        "## Top results", "",
+    ]
+    for r in payload["top_results"]:
+        lines += [f"### {r.get('camera_relevance_score')} — {r.get('title') or r.get('url')}", f"- URL: {r.get('url')}", f"- Query: `{r.get('query')}`", f"- Reasons: {', '.join(r.get('camera_relevance_reasons') or [])}", f"- Snippet: {r.get('snippet')}", ""]
+    lines += ["## Policy", "", "- No live camera viewing.", "- No open IP/misconfigured cameras.", "- No face recognition/tracking.", "- No contact with camera owners/operators.", "- No tip submission from camera-source leads alone."]
+    (outdir / "camera-search.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["camera_search"] = str((outdir / "camera-search.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "status": status, "queries_run": len(queries), "result_count": len(result_rows), "strong_count": len(strong), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -2588,6 +2840,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strong-threshold", type=int, default=70)
     p.add_argument("--limit", type=int, default=25)
     p.set_defaults(func=cmd_sherlock_corroborate)
+
+    p = sub.add_parser("camera-router", help="Route safe public/official camera sources; blocks open/private cameras")
+    p.add_argument("case")
+    p.set_defaults(func=cmd_camera_router)
+
+    p = sub.add_parser("camera-search", help="Search public camera-source leads by snippets only; no live viewing/tracking")
+    p.add_argument("case")
+    p.add_argument("--router", default="")
+    p.add_argument("--max-queries", type=int, default=12)
+    p.add_argument("--per-query", type=int, default=4)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--threshold", type=int, default=70)
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_camera_search)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
