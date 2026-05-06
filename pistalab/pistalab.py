@@ -1481,6 +1481,214 @@ def cmd_sherlock_plan(args: argparse.Namespace) -> None:
         "executed_sherlock": False,
     }, indent=2, ensure_ascii=False))
 
+
+def load_text_if_exists(path: Path) -> str:
+    return path.read_text() if path.exists() else ""
+
+
+def extract_court_clues(case: dict[str, Any], ledger_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    case_id = case["case_id"]
+    source_excerpt = load_text_if_exists(OUTPUTS / case_id / "source-check" / "source-excerpt-redacted.txt")
+    haystack = "\n".join([
+        case.get("raw_text", ""),
+        source_excerpt,
+        "\n".join(f"{r.get('title','')} {r.get('snippet','')} {r.get('url','')}" for r in ledger_rows),
+    ])
+    clues: dict[str, Any] = {
+        "districts": sorted(set(re.findall(r"Central District of California|C\.D\. Cal\.?|CDCA", haystack, re.I))),
+        "sentencing_dates": sorted(set(re.findall(r"(?:sentenced|sentencing).*?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", haystack, re.I))),
+        "money_amounts": sorted(set(re.findall(r"\$\s?\d+(?:\.\d+)?\s?(?:million|billion|M|B)?", haystack, re.I))),
+        "case_numbers": sorted(set(re.findall(r"\b(?:CR|cr|No\.|Case(?:\s+No\.)?)\s*[:#]?\s*\d{2,4}[-:]?\d{2,6}(?:[-A-Z0-9]+)?\b", haystack))),
+        "legal_terms": sorted(set(term for term in ["plea agreement", "sentenced", "convicted", "indictment", "forfeiture", "shell companies", "wire transfers", "bank accounts", "cryptocurrency scams"] if re.search(re.escape(term), haystack, re.I))),
+    }
+    official_justice_urls = sorted({r.get("url") for r in ledger_rows if r.get("kind") in {"public_search_result", "hypothesis_search_result", "hypothesis_basis_result"} and "justice.gov" in (r.get("domain") or source_domain(r.get("url", "")))})
+    clues["official_justice_urls"] = official_justice_urls
+    return clues
+
+
+def court_deepening_queries(case: dict[str, Any], clues: dict[str, Any]) -> list[dict[str, Any]]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    queries: list[dict[str, Any]] = []
+    def add(query: str, purpose: str, source_class: str = "public", risk: str = "low") -> None:
+        queries.append({"query": query, "purpose": purpose, "source_class": source_class, "risk": risk, "allowed": True})
+    add(f'"{name}" "Central District of California"', "Locate official district/case context", "official")
+    add(f'"{name}" "United States v"', "Find case caption or public docket references", "public")
+    add(f'"{name}" "plea agreement"', "Find plea documents or summaries", "public")
+    add(f'"{name}" "sentenced" "20 years"', "Find sentencing releases and summaries", "public")
+    add(f'"{name}" "73.6 million"', "Corroborate amount and forfeiture/loss context", "public")
+    add(f'"{name}" "shell companies" "bank accounts"', "Identify publicly named shell-company context", "public")
+    add(f'"{name}" site:justice.gov', "Official DOJ references", "official")
+    add(f'"{name}" site:cacd.uscourts.gov', "Official court-domain references", "official")
+    add(f'"{name}" site:govinfo.gov', "Official public filings/opinions if available", "official")
+    add(f'"{name}" site:storage.courtlistener.com', "Public RECAP/court document mirror references", "public")
+    for cn in clues.get("case_numbers") or []:
+        add(f'"{cn}" "{name}"', "Follow extracted case number", "public")
+    return queries
+
+
+def court_depth_assessment(clues: dict[str, Any], captured: list[dict[str, Any]]) -> dict[str, Any]:
+    score = 0
+    reasons: list[str] = []
+    blockers: list[str] = []
+    if clues.get("official_justice_urls"):
+        score += 25; reasons.append("official DOJ URLs present")
+    if clues.get("districts"):
+        score += 15; reasons.append("court district identified")
+    if clues.get("sentencing_dates"):
+        score += 10; reasons.append("sentencing date found")
+    if clues.get("money_amounts"):
+        score += 10; reasons.append("loss/reward amounts found")
+    terms = clues.get("legal_terms") or []
+    if "shell companies" in terms or "bank accounts" in terms:
+        score += 10; reasons.append("shell-company/bank-account angle present")
+    if clues.get("case_numbers"):
+        score += 20; reasons.append("case number extracted")
+    else:
+        blockers.append("case number not extracted yet")
+    official_captured = [r for r in captured if r.get("official_domain")]
+    if official_captured:
+        score += min(10, len(official_captured) * 3); reasons.append("deepening captured official-domain results")
+    if not captured:
+        blockers.append("search capture produced no new result rows")
+    if score >= 75 and clues.get("case_numbers"):
+        status = "DOCKET_PATH_READY"
+    elif score >= 55:
+        status = "CASE_CONTEXT_FOUND_NOT_DOCKET"
+    else:
+        status = "COURT_CONTEXT_INCOMPLETE"
+    return {
+        "court_depth_score": min(score, 100),
+        "status": status,
+        "reasons": reasons,
+        "blockers": blockers,
+        "external_actions_performed": False,
+    }
+
+
+def cmd_court_deepen(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    ledger_path = Path(args.ledger) if args.ledger else EVIDENCE / case_id / "captures" / "evidence-ledger.jsonl"
+    ledger_rows = read_jsonl(ledger_path)
+    clues = extract_court_clues(case, ledger_rows)
+    queries = court_deepening_queries(case, clues)
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "court-deepening"
+    outdir.mkdir(parents=True, exist_ok=True)
+    trace_dir = EVIDENCE / case_id / "court-deepening"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_ledger = trace_dir / "court-deepening-ledger.jsonl"
+    captured: list[dict[str, Any]] = []
+    # Always trace official DOJ basis URLs already found.
+    for url in clues.get("official_justice_urls") or []:
+        row = {
+            "case_id": case_id,
+            "kind": "court_official_basis",
+            "url": url,
+            "domain": source_domain(url),
+            "title": url,
+            "captured_at": now_iso(),
+            "official_domain": is_official_domain(url),
+            "relevance_score": 60,
+            "external_actions_performed": False,
+            "policy": "official/public court deepening basis; no contact/private data",
+        }
+        append_jsonl(trace_ledger, row)
+        captured.append(row)
+    queries_run = 0
+    if args.run_search:
+        for q in queries:
+            queries_run += 1
+            results = ddg_search(q["query"], limit=args.per_query)
+            if not results:
+                append_jsonl(trace_ledger, {"case_id": case_id, "kind": "court_search_no_results", "query": q["query"], "captured_at": now_iso(), "external_actions_performed": False})
+            for rank, result in enumerate(results, 1):
+                if result.get("title") == "SEARCH_ERROR":
+                    append_jsonl(trace_ledger, {"case_id": case_id, "kind": "court_search_error", "query": q["query"], "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False})
+                    continue
+                rel = evidence_relevance_score(case, result)
+                row = {
+                    "case_id": case_id,
+                    "kind": "court_search_result",
+                    "query": q["query"],
+                    "query_purpose": q["purpose"],
+                    "rank": rank,
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "domain": source_domain(result.get("url", "")),
+                    "snippet": redact_sensitive_lines(result.get("snippet", "")),
+                    "captured_at": now_iso(),
+                    "official_domain": is_official_domain(result.get("url", "")),
+                    "relevance_score": rel["score"],
+                    "relevance_reasons": rel["reasons"],
+                    "external_actions_performed": False,
+                    "policy": "court deepening: public/official sources only; no contact/private data",
+                }
+                append_jsonl(trace_ledger, row)
+                append_jsonl(ledger_path, row)
+                captured.append(row)
+            time.sleep(args.delay)
+    assessment = court_depth_assessment(clues, captured)
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "queries": queries,
+        "queries_run": queries_run,
+        "clues": clues,
+        "assessment": assessment,
+        "captured_count": len(captured),
+        "trace_ledger": str(trace_ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "blocked_paths": [
+            "Do not access sealed filings",
+            "Do not buy private database records",
+            "Do not contact victims, witnesses, co-defendants, relatives, employers, or alleged associates",
+            "Do not submit tips based only on court-context corroboration",
+        ],
+    }
+    write_json(outdir / "court-deepening.json", payload)
+    lines = [
+        f"# Court Records Deepening — {case_id}",
+        "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Court depth score: {assessment['court_depth_score']}",
+        f"- Status: {assessment['status']}",
+        f"- Queries run: {queries_run}",
+        f"- Captured rows: {len(captured)}",
+        "- External actions performed: false",
+        "",
+        "## Clues",
+        "",
+        "```json",
+        json.dumps(clues, indent=2, ensure_ascii=False),
+        "```",
+        "",
+        "## Reasons",
+        "",
+    ]
+    lines += [f"- {r}" for r in assessment["reasons"]] or ["- none"]
+    lines += ["", "## Blockers", ""]
+    lines += [f"- {b}" for b in assessment["blockers"]] or ["- none"]
+    lines += ["", "## Safe court queries", ""]
+    for q in queries:
+        lines.append(f"- `{q['query']}` — {q['purpose']}")
+    lines += ["", "## Blocked paths", ""]
+    lines += [f"- {b}" for b in payload["blocked_paths"]]
+    (outdir / "court-deepening.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("court_deepening", {})["latest"] = str((outdir / "court-deepening.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "court_depth_score": assessment["court_depth_score"],
+        "status": assessment["status"],
+        "captured_count": len(captured),
+        "queries_run": queries_run,
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+    }, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -1617,6 +1825,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allowed-only", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.set_defaults(func=cmd_sherlock_plan)
+
+    p = sub.add_parser("court-deepen", help="Deepen public court-record context from official/public sources")
+    p.add_argument("case")
+    p.add_argument("--ledger", default="")
+    p.add_argument("--run-search", action="store_true", help="Run safe public search queries; otherwise trace known official basis only")
+    p.add_argument("--max-queries", type=int, default=0)
+    p.add_argument("--per-query", type=int, default=4)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.set_defaults(func=cmd_court_deepen)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")

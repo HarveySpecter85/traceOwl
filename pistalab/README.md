@@ -17,7 +17,8 @@ It is designed for:
 - lead hypothesis generation,
 - traceable research memory,
 - draft-only tip packets for human review,
-- optional Sherlock username-correlation planning for officially published aliases.
+- optional Sherlock username-correlation planning for officially published aliases,
+- court-record deepening for public/official docket context.
 
 ## What this is not
 
