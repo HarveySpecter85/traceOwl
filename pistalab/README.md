@@ -25,7 +25,8 @@ It is designed for:
 - Sherlock result triage and search-snippet corroboration,
 - public/official camera-source routing and snippet-only search with unsafe camera discovery blocked,
 - route runner for ready public routes with excerpts, hashes, deltas, and review scoring,
-- review extractor for actionable/monitor/parking-lot signal decisions.
+- review extractor for actionable/monitor/parking-lot signal decisions,
+- beyond-official public OSINT routing/search/extraction for non-government source handles.
 
 ## What this is not
 

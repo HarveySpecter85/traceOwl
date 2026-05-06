@@ -2988,6 +2988,436 @@ def cmd_review_extractor(args: argparse.Namespace) -> None:
         cmd_hypotheses(argparse.Namespace(case=args.case, ledger="", score="", limit=0))
     print(json.dumps({"case_id": case_id, "status": status, "reviewed_count": len(extracted), "actionable_count": len(actionable), "monitor_count": len(monitor), "refresh_recommended": bool(actionable), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
 
+
+BEYOND_OFFICIAL_BLOCKED = [
+    "No leaked/private databases or breach dumps",
+    "No personal address/phone/relative searches",
+    "No contacting victims, witnesses, suspects, relatives, associates, companies, exchanges, or reporters",
+    "No paid/private investigator databases",
+    "No credentialed blockchain analytics accounts unless separately authorized",
+    "No hacked infrastructure or dark-web access",
+    "No public accusation or tip submission from uncorroborated leads",
+]
+
+
+def beyond_official_routes(case: dict[str, Any]) -> list[dict[str, Any]]:
+    routes: list[dict[str, Any]] = []
+    def add(source_id: str, label: str, source_type: str, purpose: str, priority: int, status: str = "ready", notes: str = "", allowed: bool = True):
+        routes.append({
+            "source_id": source_id,
+            "label": label,
+            "source_type": source_type,
+            "purpose": purpose,
+            "priority": priority,
+            "status": status,
+            "allowed": allowed,
+            "notes": notes,
+            "blocked_paths": BEYOND_OFFICIAL_BLOCKED,
+        })
+    add("crypto-exchange-compliance", "Crypto exchange / compliance public posts", "crypto_compliance_public", "Find exchange/compliance writeups mentioning case, wallets, scam typology, or recovery actions", 95)
+    add("blockchain-public-intel", "Public blockchain intelligence/blogs", "blockchain_public_intel", "Find public wallet, flow, typology, seizure, or laundering-route references", 92)
+    add("scam-victim-public-reports", "Public scam/victim report aggregators", "victim_report_public", "Find public reports by scam type, entity names, domains, aliases, or wallet fragments", 86, notes="Only public posts; do not contact victims.")
+    add("domain-infrastructure-public", "Domain/infrastructure public OSINT", "domain_public_osint", "Find spoofed trading domains, hosting clues, public RDAP/WHOIS, archived pages", 82)
+    add("corporate-registry-public", "Public corporate registry / shell-company mentions", "corporate_registry_public", "Find publicly named shell companies/entities from reporting or filings", 78)
+    add("international-media", "International/local media", "media_public", "Find non-US public reporting, Cambodia/China/St. Kitts/crypto scam center context", 75)
+    add("sanctions-watchlists", "Sanctions/watchlist/public risk databases", "watchlist_public", "Check public sanctions/adverse-media style references", 70)
+    add("academic-ngo-reports", "Academic/NGO scam-center reports", "ngo_academic_public", "Understand scam-center geography/operators/typologies for hypothesis generation", 62)
+    add("social-snippet-public", "Public social/web snippet crosscheck", "social_snippet_public", "Search public snippets only for distinctive aliases connected to case terms", 55, notes="No profile opening/contact; weak correlation only.")
+    add("dark-web-leaks", "Dark web / leaked databases", "leaked_private_data", "Leaked/private data route", 0, "blocked_prohibited", "Blocked: no leaked/private/dark-web data.", allowed=False)
+    add("people-search-doxxing", "People-search / relatives / addresses", "doxxing_private", "Personal data route", 0, "blocked_prohibited", "Blocked: no doxxing/private personal data.", allowed=False)
+    routes.sort(key=lambda r: r["priority"], reverse=True)
+    return routes
+
+
+def beyond_official_queries(case: dict[str, Any]) -> list[dict[str, Any]]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    aliases = [a for a in (entity.get("aliases") or []) if a and len(a) > 2]
+    queries: list[dict[str, Any]] = []
+    def add(q: str, purpose: str, route_id: str, risk: str = "low", allowed: bool = True):
+        queries.append({"query": q, "purpose": purpose, "route_id": route_id, "risk": risk, "allowed": allowed})
+    if name:
+        add(f'"{name}" cryptocurrency scam wallet', "Wallet/crypto public references", "blockchain-public-intel")
+        add(f'"{name}" "Binance" OR "Tether" OR "TRON" OR "USDT"', "Exchange/chain context", "crypto-exchange-compliance")
+        add(f'"{name}" "pig butchering" "Cambodia"', "Scam-center context", "international-media")
+        add(f'"{name}" "scam center" OR "fraud compound"', "Scam-center/operator context", "academic-ngo-reports")
+        add(f'"{name}" "shell company" OR "bank account"', "Shell-company public mentions", "corporate-registry-public")
+        add(f'"{name}" "spoofed" "domain" cryptocurrency', "Spoofed platform/domain artifacts", "domain-infrastructure-public")
+        add(f'"{name}" "victim" "cryptocurrency"', "Public victim/report references", "scam-victim-public-reports")
+        add(f'"{name}" "St. Kitts" "Nevis"', "International identity/public reporting context", "international-media")
+    for alias in aliases[:6]:
+        if len(alias) <= 3:
+            add(f'"{alias}" "{name}"', "Short/common alias requires primary-name anchor", "social-snippet-public", risk="medium")
+            continue
+        add(f'"{alias}" "Daren Li"', "Alias anchored to primary name", "social-snippet-public", risk="medium")
+        add(f'"{alias}" "money laundering"', "Alias + allegation", "social-snippet-public", risk="medium")
+        add(f'"{alias}" cryptocurrency scam', "Alias + scam typology", "social-snippet-public", risk="medium")
+    # Entity/topic searches not person-private.
+    add('"$73.6 million" "victim funds" cryptocurrency scam', "Amount-specific public reporting", "crypto-exchange-compliance")
+    add('"59.8 million" "shell companies" "victim proceeds"', "Shell-company amount-specific reporting", "corporate-registry-public")
+    add('"Cambodia" "cryptocurrency investment scam" "money laundering" "shell companies"', "Scam-center laundering ecosystem", "academic-ngo-reports")
+    # blocked examples
+    add(f'"{name}" address phone relatives', "Blocked doxxing query", "people-search-doxxing", risk="prohibited", allowed=False)
+    add(f'"{name}" leaked database passport', "Blocked leaked/private data query", "dark-web-leaks", risk="prohibited", allowed=False)
+    return queries
+
+
+def beyond_result_score(case: dict[str, Any], result: dict[str, str], route_id: str) -> dict[str, Any]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    aliases = entity.get("aliases") or []
+    haystack = f"{result.get('title','')} {result.get('snippet','')} {result.get('url','')}"
+    score = 0
+    reasons: list[str] = []
+    if name and re.search(re.escape(name), haystack, re.I):
+        score += 30; reasons.append("primary name match")
+    alias_hits = []
+    for alias in aliases:
+        if alias and len(alias) > 2 and re.search(re.escape(alias), haystack, re.I):
+            alias_hits.append(alias)
+    if alias_hits:
+        score += min(15, 6 * len(set(alias_hits))); reasons.append("alias hits: " + ", ".join(sorted(set(alias_hits))))
+    if re.search(r"wallet|address|transaction|blockchain|USDT|TRON|Bitcoin|Ethereum|stablecoin|seiz", haystack, re.I):
+        score += 25; reasons.append("crypto-rail artifact terms")
+    if re.search(r"domain|spoofed|website|hosting|registrar|WHOIS|RDAP", haystack, re.I):
+        score += 20; reasons.append("infrastructure/domain terms")
+    if re.search(r"shell compan|bank account|wire transfer|victim funds|proceeds", haystack, re.I):
+        score += 20; reasons.append("shell/banking/funds terms")
+    if re.search(r"Cambodia|scam center|fraud compound|pig butchering|human trafficking", haystack, re.I):
+        score += 15; reasons.append("scam-center context")
+    if re.search(r"Justice|Secret Service|State Department|DOJ|USSS", haystack, re.I):
+        score += 8; reasons.append("official-case context referenced")
+    domain = source_domain(result.get("url", ""))
+    if domain in {"binance.com", "chainalysis.com", "trmlabs.com", "elliptic.co", "tronscan.org", "etherscan.io", "bitcoinabuse.com", "scamsearch.io"}:
+        score += 12; reasons.append("higher-signal crypto/compliance domain")
+    if route_id in {"dark-web-leaks", "people-search-doxxing"} or re.search(r"leaked|ssn|passport|address|phone|relative", haystack, re.I):
+        score = 0; reasons.append("blocked private/doxxing/leak signal")
+    score = max(0, min(100, score))
+    if score >= 75:
+        verdict = "A_CORROBORATE_NOW"
+    elif score >= 45:
+        verdict = "B_REVIEW"
+    else:
+        verdict = "C_PARK"
+    return {"beyond_score": score, "beyond_verdict": verdict, "beyond_reasons": reasons, "alias_hits": sorted(set(alias_hits))}
+
+
+def cmd_beyond_router(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    routes = beyond_official_routes(case)
+    queries = beyond_official_queries(case)
+    outdir = OUTPUTS / case_id / "beyond-official-router"
+    outdir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "routes": routes,
+        "queries": queries,
+        "ready_count": sum(1 for r in routes if r.get("allowed")),
+        "blocked_count": sum(1 for r in routes if not r.get("allowed")),
+        "allowed_queries": sum(1 for q in queries if q.get("allowed")),
+        "blocked_queries": sum(1 for q in queries if not q.get("allowed")),
+        "external_actions_performed": False,
+        "policy": "Beyond-official public OSINT only. No leaks/private data/doxxing/contact/submission.",
+    }
+    write_json(outdir / "beyond-official-router.json", payload)
+    lines = [f"# Beyond Official Source Router — {case_id}", "", f"- Generated: {payload['generated_at']}", f"- Ready routes: {payload['ready_count']}", f"- Blocked routes: {payload['blocked_count']}", f"- Allowed queries: {payload['allowed_queries']}", f"- Blocked queries: {payload['blocked_queries']}", "- External actions performed: false", "", "## Routes", ""]
+    for r in routes:
+        mark = "READY" if r.get("allowed") else "BLOCKED"
+        lines += [f"### {r['priority']} — {mark} — {r['label']}", f"- Type: `{r['source_type']}`", f"- Purpose: {r['purpose']}", f"- Notes: {r.get('notes') or 'none'}", ""]
+    lines += ["## Queries", ""]
+    for q in queries:
+        mark = "ALLOW" if q.get("allowed") else "BLOCK"
+        lines.append(f"- {mark}: `{q['query']}` — {q['purpose']}")
+    (outdir / "beyond-official-router.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["beyond_official_router"] = str((outdir / "beyond-official-router.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "ready_routes": payload["ready_count"], "blocked_routes": payload["blocked_count"], "allowed_queries": payload["allowed_queries"], "blocked_queries": payload["blocked_queries"], "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
+
+def cmd_beyond_search(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    router_path = Path(args.router) if args.router else OUTPUTS / case_id / "beyond-official-router" / "beyond-official-router.json"
+    if not router_path.exists():
+        cmd_beyond_router(argparse.Namespace(case=args.case))
+    router = read_json(router_path)
+    queries = [q for q in router.get("queries", []) if q.get("allowed")]
+    if args.route_id:
+        wanted = set(args.route_id)
+        queries = [q for q in queries if q.get("route_id") in wanted]
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "beyond-official-search"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "beyond-official-search"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "beyond-official-search-ledger.jsonl"
+    rows: list[dict[str, Any]] = []
+    for q in queries:
+        results = ddg_search(q["query"], limit=args.per_query)
+        if not results:
+            row = {"case_id": case_id, "kind": "beyond_official_no_results", **q, "captured_at": now_iso(), "external_actions_performed": False}
+            append_jsonl(ledger, row); rows.append(row)
+        for rank, result in enumerate(results, 1):
+            if result.get("title") == "SEARCH_ERROR":
+                row = {"case_id": case_id, "kind": "beyond_official_search_error", **q, "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False}
+                append_jsonl(ledger, row); rows.append(row); continue
+            scored = beyond_result_score(case, result, q.get("route_id", ""))
+            row = {
+                "case_id": case_id,
+                "kind": "beyond_official_public_result",
+                **q,
+                "rank": rank,
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "domain": source_domain(result.get("url", "")),
+                "snippet": redact_sensitive_lines(result.get("snippet", "")),
+                "captured_at": now_iso(),
+                "external_actions_performed": False,
+                "policy": "Public web snippets only. No private data, no contact, no submissions.",
+                **scored,
+            }
+            append_jsonl(ledger, row); rows.append(row)
+        time.sleep(args.delay)
+    result_rows = [r for r in rows if r.get("kind") == "beyond_official_public_result"]
+    result_rows.sort(key=lambda r: r.get("beyond_score", 0), reverse=True)
+    a = [r for r in result_rows if r.get("beyond_verdict") == "A_CORROBORATE_NOW"]
+    b = [r for r in result_rows if r.get("beyond_verdict") == "B_REVIEW"]
+    status = "BEYOND_OFFICIAL_A_SIGNALS_FOUND" if a else ("BEYOND_OFFICIAL_B_SIGNALS_FOUND" if b else "NO_STRONG_BEYOND_OFFICIAL_SIGNALS")
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "queries_run": len(queries),
+        "result_count": len(result_rows),
+        "a_count": len(a),
+        "b_count": len(b),
+        "top_results": result_rows[: args.limit],
+        "ledger": str(ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "policy": "Beyond-official public OSINT only. Results require corroboration before action.",
+    }
+    write_json(outdir / "beyond-official-search.json", payload)
+    lines = [f"# Beyond Official Search — {case_id}", "", f"- Generated: {payload['generated_at']}", f"- Status: {status}", f"- Queries run: {len(queries)}", f"- Results: {len(result_rows)}", f"- A signals: {len(a)}", f"- B signals: {len(b)}", "- External actions performed: false", "", "## Top results", ""]
+    for r in payload["top_results"]:
+        lines += [f"### {r.get('beyond_score')} — {r.get('beyond_verdict')} — {r.get('title') or r.get('url')}", f"- Route: `{r.get('route_id')}`", f"- URL: {r.get('url')}", f"- Query: `{r.get('query')}`", f"- Reasons: {', '.join(r.get('beyond_reasons') or []) or 'none'}", f"- Snippet: {r.get('snippet')}", ""]
+    lines += ["## Policy", "", "- Public snippets only.", "- No private/leaked data.", "- No contact.", "- No tip submission."]
+    (outdir / "beyond-official-search.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["beyond_official_search"] = str((outdir / "beyond-official-search.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "status": status, "queries_run": len(queries), "result_count": len(result_rows), "a_count": len(a), "b_count": len(b), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
+
+def beyond_artifacts_from_text(text: str) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {
+        "aliases": [],
+        "platforms": [],
+        "companies": [],
+        "accounts": [],
+        "locations": [],
+        "dates": [],
+        "amounts": [],
+        "crypto_terms": [],
+        "investigative_hooks": [],
+    }
+    alias_patterns = [r"aliases? such as [“\"]([^”\"]+)[”\"] and [“\"]([^”\"]+)[”\"]", r"under aliases? such as ([A-Z0-9_\-]+) and ([A-Z0-9_\-]+)"]
+    for pat in alias_patterns:
+        for m in re.findall(pat, text, re.I):
+            for item in (m if isinstance(m, tuple) else [m]):
+                artifacts["aliases"].append(item.strip(" .,'\"“”"))
+    for m in re.findall(r"including spoofed websites designed to mimic legitimate exchanges such as [“\"]([^”\"]+)[”\"]", text, re.I):
+        artifacts["platforms"].append(m.strip(" .,’‘,\"“”"))
+    cm = re.search(r"Entities such as (.+?) were used", text, re.I | re.S)
+    if cm:
+        segment = re.sub(r"\s+", " ", cm.group(1)).strip(" .")
+        # Known pattern in TRM article: company name contains "and".
+        if re.search(r"CMD Export and Import", segment, re.I):
+            artifacts["companies"].append("CMD Export and Import")
+        if re.search(r"Crestview Services", segment, re.I):
+            artifacts["companies"].append("Crestview Services, Inc")
+        if not artifacts["companies"]:
+            for part in re.split(r",\s+and\s+", segment):
+                part = part.strip(" .,’‘,\"“”")
+                if part:
+                    artifacts["companies"].append(part)
+    for pat in [r"(Bahamas Account #[0-9]+)", r"([A-Za-z]+ Account #[0-9]+)"]:
+        for m in re.findall(pat, text): artifacts["accounts"].append(m.strip())
+    for loc in ["Hartsfield-Jackson Atlanta International Airport", "Cambodia", "Kingdom of Cambodia", "Bahamas", "Los Angeles", "Central District of California", "Dominican Republic", "St. Kitts and Nevis", "China"]:
+        if re.search(re.escape(loc), text, re.I): artifacts["locations"].append(loc)
+    for m in re.findall(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+\d{4}|\b\d{4}\b", text):
+        artifacts["dates"].append(m.strip())
+    for m in re.findall(r"USD\s*[0-9.]+\s*(?:million|billion)|\$\s*[0-9.]+\s*(?:million|billion)|[0-9.]+\s*million", text, re.I):
+        artifacts["amounts"].append(m.strip())
+    for term in ["USDT", "Tether", "TRON", "Bitcoin", "Ethereum", "virtual asset service provider", "VASP", "blockchain intelligence", "stablecoin"]:
+        if re.search(re.escape(term), text, re.I): artifacts["crypto_terms"].append(term)
+    for hook in ["74 shell companies", "Victim 1", "May and August 2022", "CoinZoom", "Bahamas Account #2", "Los Angeles-based co-conspirator", "iPhone seized from a co-conspirator", "frequent logins from Cambodia"]:
+        if re.search(re.escape(hook), text, re.I): artifacts["investigative_hooks"].append(hook)
+    return {k: sorted(set(v)) for k, v in artifacts.items() if v}
+
+
+def beyond_artifact_queries(case: dict[str, Any], artifacts: dict[str, Any]) -> list[dict[str, Any]]:
+    name = (case.get("entities") or [{}])[0].get("name", "")
+    queries: list[dict[str, Any]] = []
+    def add(q: str, purpose: str, artifact_type: str, risk: str = "low"):
+        queries.append({"query": q, "purpose": purpose, "artifact_type": artifact_type, "risk": risk, "allowed": True})
+    for alias in artifacts.get("aliases", []):
+        add(f'"{alias}" "{name}"', "New alias anchored to primary name", "alias", "medium")
+        add(f'"{alias}" "money laundering" cryptocurrency', "Alias + allegation/crypto context", "alias", "medium")
+    for platform in artifacts.get("platforms", []):
+        add(f'"{platform}" "Daren Li"', "Spoofed platform linked to case", "platform")
+        add(f'"{platform}" "pig butchering" "USDT"', "Spoofed platform scam context", "platform")
+    for company in artifacts.get("companies", []):
+        add(f'"{company}" "Daren Li"', "Shell company linked to primary name", "company")
+        add(f'"{company}" "cryptocurrency" "wire transfer"', "Shell company financial context", "company")
+    for account in artifacts.get("accounts", []):
+        add(f'"{account}" "Daren Li"', "Named account reference", "account")
+    for hook in artifacts.get("investigative_hooks", []):
+        if hook in {"Victim 1", "iPhone seized from a co-conspirator"}:
+            continue
+        add(f'"{hook}" "Daren Li"', "Hook anchored to primary name", "hook")
+    return queries
+
+
+def cmd_beyond_extract(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    search_path = Path(args.search) if args.search else OUTPUTS / case_id / "beyond-official-search" / "beyond-official-search.json"
+    if not search_path.exists():
+        raise SystemExit(f"Beyond search output not found: {search_path}. Run beyond-search first.")
+    search = read_json(search_path)
+    results = search.get("top_results", [])[: args.max_results]
+    outdir = OUTPUTS / case_id / "beyond-evidence-extractor"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "beyond-evidence-extractor"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "beyond-evidence-extractor-ledger.jsonl"
+    extracted: list[dict[str, Any]] = []
+    all_queries: list[dict[str, Any]] = []
+    for result in results:
+        url = result.get("url", "")
+        fetch = safe_fetch_excerpt(url, max_chars=args.excerpt_chars)
+        text = fetch.get("excerpt", "") or ""
+        artifacts = beyond_artifacts_from_text(text)
+        queries = beyond_artifact_queries(case, artifacts)
+        all_queries.extend(queries)
+        row = {
+            "case_id": case_id,
+            "kind": "beyond_evidence_artifact_extraction",
+            "source_title": result.get("title"),
+            "url": url,
+            "domain": source_domain(url),
+            "fetched": fetch.get("fetched"),
+            "http_status": fetch.get("http_status"),
+            "excerpt_sha256": fetch.get("excerpt_sha256"),
+            "artifacts": artifacts,
+            "derived_query_count": len(queries),
+            "captured_at": now_iso(),
+            "external_actions_performed": False,
+            "policy": "Public article extraction only. No contact, private data, leaks, or submissions.",
+        }
+        append_jsonl(ledger, row); extracted.append(row)
+        time.sleep(args.delay)
+    # De-dupe derived queries.
+    seen = set(); deduped=[]
+    for q in all_queries:
+        if q["query"] in seen: continue
+        seen.add(q["query"]); deduped.append(q)
+    strength = 0
+    artifact_counts: dict[str, int] = {}
+    for row in extracted:
+        for k, v in (row.get("artifacts") or {}).items():
+            artifact_counts[k] = artifact_counts.get(k, 0) + len(v)
+    if artifact_counts.get("aliases"): strength += 25
+    if artifact_counts.get("companies"): strength += 25
+    if artifact_counts.get("platforms"): strength += 20
+    if artifact_counts.get("accounts"): strength += 20
+    if artifact_counts.get("locations"): strength += 10
+    status = "NEW_BEYOND_ARTIFACTS_FOUND" if strength >= 25 else "NO_USEFUL_BEYOND_ARTIFACTS"
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "artifact_strength_score": min(strength, 100),
+        "artifact_counts": artifact_counts,
+        "sources_reviewed": len(extracted),
+        "extractions": extracted,
+        "derived_queries": deduped,
+        "ledger": str(ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "policy": "Beyond-official extraction is public-source only; derived queries require safe-search workers and corroboration.",
+    }
+    write_json(outdir / "beyond-evidence-extractor.json", payload)
+    lines = [f"# Beyond Evidence Extractor — {case_id}", "", f"- Generated: {payload['generated_at']}", f"- Status: {status}", f"- Artifact strength: {payload['artifact_strength_score']}", f"- Sources reviewed: {len(extracted)}", f"- Derived queries: {len(deduped)}", "- External actions performed: false", "", "## Artifact counts", ""]
+    for k, v in sorted(artifact_counts.items()): lines.append(f"- {k}: {v}")
+    lines += ["", "## Extracted artifacts", ""]
+    for row in extracted:
+        lines += [f"### {row.get('source_title') or row.get('url')}", f"- URL: {row.get('url')}", f"- Fetched: {row.get('fetched')} / HTTP: {row.get('http_status')}", f"- Artifacts: `{json.dumps(row.get('artifacts') or {}, ensure_ascii=False)[:1200]}`", ""]
+    lines += ["## Derived queries", ""]
+    for q in deduped[: args.query_report_limit]: lines.append(f"- `{q['query']}` — {q['purpose']}")
+    lines += ["", "## Policy", "", "- Public articles only.", "- No private/leaked data.", "- No contact.", "- No submission."]
+    (outdir / "beyond-evidence-extractor.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["beyond_evidence_extractor"] = str((outdir / "beyond-evidence-extractor.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "status": status, "artifact_strength_score": min(strength, 100), "artifact_counts": artifact_counts, "sources_reviewed": len(extracted), "derived_queries": len(deduped), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
+
+def cmd_beyond_derived_search(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    extract_path = Path(args.extract) if args.extract else OUTPUTS / case_id / "beyond-evidence-extractor" / "beyond-evidence-extractor.json"
+    if not extract_path.exists():
+        raise SystemExit(f"Beyond extractor output not found: {extract_path}. Run beyond-extract first.")
+    extraction = read_json(extract_path)
+    queries = [q for q in extraction.get("derived_queries", []) if q.get("allowed")]
+    if args.artifact_type:
+        wanted = set(args.artifact_type)
+        queries = [q for q in queries if q.get("artifact_type") in wanted]
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "beyond-derived-search"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "beyond-derived-search"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "beyond-derived-search-ledger.jsonl"
+    rows: list[dict[str, Any]] = []
+    for q in queries:
+        results = ddg_search(q["query"], limit=args.per_query)
+        if not results:
+            row = {"case_id": case_id, "kind": "beyond_derived_no_results", **q, "captured_at": now_iso(), "external_actions_performed": False}
+            append_jsonl(ledger, row); rows.append(row)
+        for rank, result in enumerate(results, 1):
+            if result.get("title") == "SEARCH_ERROR":
+                row = {"case_id": case_id, "kind": "beyond_derived_search_error", **q, "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False}
+                append_jsonl(ledger, row); rows.append(row); continue
+            scored = beyond_result_score(case, result, q.get("artifact_type", ""))
+            # artifact-specific boost only when query phrase appears in title/snippet/url
+            phrase = q.get("query", "").split('"')[1] if '"' in q.get("query", "") else ""
+            haystack = f"{result.get('title','')} {result.get('snippet','')} {result.get('url','')}"
+            if phrase and re.search(re.escape(phrase), haystack, re.I):
+                scored["beyond_score"] = min(100, scored["beyond_score"] + 20)
+                scored["beyond_reasons"].append("derived artifact phrase hit")
+                scored["beyond_verdict"] = "A_CORROBORATE_NOW" if scored["beyond_score"] >= 75 else ("B_REVIEW" if scored["beyond_score"] >= 45 else "C_PARK")
+            row = {"case_id": case_id, "kind": "beyond_derived_public_result", **q, "rank": rank, "title": result.get("title", ""), "url": result.get("url", ""), "domain": source_domain(result.get("url", "")), "snippet": redact_sensitive_lines(result.get("snippet", "")), "captured_at": now_iso(), "external_actions_performed": False, "policy": "Derived artifact public search only. No private data/contact/submission.", **scored}
+            append_jsonl(ledger, row); rows.append(row)
+        time.sleep(args.delay)
+    result_rows = [r for r in rows if r.get("kind") == "beyond_derived_public_result"]
+    result_rows.sort(key=lambda r: r.get("beyond_score", 0), reverse=True)
+    a = [r for r in result_rows if r.get("beyond_verdict") == "A_CORROBORATE_NOW"]
+    b = [r for r in result_rows if r.get("beyond_verdict") == "B_REVIEW"]
+    status = "DERIVED_A_SIGNALS_FOUND" if a else ("DERIVED_B_SIGNALS_FOUND" if b else "NO_STRONG_DERIVED_SIGNALS")
+    payload = {"case_id": case_id, "generated_at": now_iso(), "status": status, "queries_run": len(queries), "result_count": len(result_rows), "a_count": len(a), "b_count": len(b), "top_results": result_rows[: args.limit], "ledger": str(ledger.relative_to(ROOT)), "external_actions_performed": False, "policy": "Derived artifact search uses public snippets only; corroboration required."}
+    write_json(outdir / "beyond-derived-search.json", payload)
+    lines = [f"# Beyond Derived Search — {case_id}", "", f"- Generated: {payload['generated_at']}", f"- Status: {status}", f"- Queries run: {len(queries)}", f"- Results: {len(result_rows)}", f"- A signals: {len(a)}", f"- B signals: {len(b)}", "- External actions performed: false", "", "## Top results", ""]
+    for r in payload["top_results"]:
+        lines += [f"### {r.get('beyond_score')} — {r.get('beyond_verdict')} — {r.get('title') or r.get('url')}", f"- Artifact: `{r.get('artifact_type')}`", f"- URL: {r.get('url')}", f"- Query: `{r.get('query')}`", f"- Reasons: {', '.join(r.get('beyond_reasons') or []) or 'none'}", f"- Snippet: {r.get('snippet')}", ""]
+    lines += ["## Policy", "", "- Public snippets only.", "- No private/leaked data.", "- No contact.", "- No submission."]
+    (outdir / "beyond-derived-search.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["beyond_derived_search"] = str((outdir / "beyond-derived-search.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "status": status, "queries_run": len(queries), "result_count": len(result_rows), "a_count": len(a), "b_count": len(b), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -3220,6 +3650,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preview-chars", type=int, default=500)
     p.add_argument("--refresh", action="store_true", help="Refresh graph/hypotheses only if actionable signals are found")
     p.set_defaults(func=cmd_review_extractor)
+
+    p = sub.add_parser("beyond-router", help="Route beyond-official public OSINT sources; blocks leaks/doxxing/private data")
+    p.add_argument("case")
+    p.set_defaults(func=cmd_beyond_router)
+
+    p = sub.add_parser("beyond-search", help="Search beyond-official public sources by snippets only")
+    p.add_argument("case")
+    p.add_argument("--router", default="")
+    p.add_argument("--route-id", action="append", default=[])
+    p.add_argument("--max-queries", type=int, default=18)
+    p.add_argument("--per-query", type=int, default=5)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=cmd_beyond_search)
+
+    p = sub.add_parser("beyond-extract", help="Fetch top beyond-official public results and extract artifacts/derived queries")
+    p.add_argument("case")
+    p.add_argument("--search", default="")
+    p.add_argument("--max-results", type=int, default=5)
+    p.add_argument("--excerpt-chars", type=int, default=12000)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--query-report-limit", type=int, default=30)
+    p.set_defaults(func=cmd_beyond_extract)
+
+    p = sub.add_parser("beyond-derived-search", help="Run public searches from beyond-extract derived artifact queries")
+    p.add_argument("case")
+    p.add_argument("--extract", default="")
+    p.add_argument("--artifact-type", action="append", default=[])
+    p.add_argument("--max-queries", type=int, default=16)
+    p.add_argument("--per-query", type=int, default=5)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=cmd_beyond_derived_search)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
