@@ -1382,6 +1382,105 @@ def cmd_tip_packet(args: argparse.Namespace) -> None:
         "submitted": False,
     }, indent=2, ensure_ascii=False))
 
+
+def safe_username_candidates(case: dict[str, Any]) -> list[dict[str, Any]]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    aliases = entity.get("aliases") or []
+    candidates: list[dict[str, Any]] = []
+    def add(value: str, source: str, allowed: bool, reason: str, risk: str = "medium") -> None:
+        value = re.sub(r"[^A-Za-z0-9_.-]", "", value.strip())
+        if not value:
+            return
+        if value.lower() not in {c["username"].lower() for c in candidates}:
+            candidates.append({"username": value, "source": source, "allowed": allowed, "reason": reason, "risk": risk})
+    for alias in aliases:
+        compact = re.sub(r"\s+", "", alias)
+        if len(compact) < 4:
+            add(compact, "official_alias", False, "alias too short/common; high false-positive risk", "high")
+        else:
+            add(compact, "official_alias", True, "official alias, long enough for public username correlation", "medium")
+            if " " in alias:
+                add(alias.replace(" ", "_"), "official_alias_variant", True, "underscore variant of official alias", "medium")
+                add(alias.replace(" ", "."), "official_alias_variant", True, "dot variant of official alias", "medium")
+    if name:
+        parts = [x for x in re.split(r"\s+", name) if x]
+        if len(parts) >= 2:
+            add("".join(parts), "primary_name_variant", True, "primary-name compact variant; corroboration only", "medium")
+            add(".".join(parts), "primary_name_variant", True, "primary-name dot variant; corroboration only", "medium")
+    return candidates
+
+
+def cmd_sherlock_plan(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    candidates = safe_username_candidates(case)
+    if args.allowed_only:
+        candidates = [c for c in candidates if c["allowed"]]
+    outdir = OUTPUTS / case_id / "sherlock-plan"
+    outdir.mkdir(parents=True, exist_ok=True)
+    tool = {
+        "name": "sherlock-project/sherlock",
+        "url": "https://github.com/sherlock-project/sherlock",
+        "license": "MIT",
+        "audited_commit": "4e2a4f6",
+        "purpose": "Username presence checks across public sites for officially published aliases only.",
+        "policy": "Correlation only. No contact, no login, no harassment, no accusation, no external submission.",
+    }
+    allowed = [c for c in candidates if c["allowed"]]
+    command_preview = []
+    if allowed:
+        usernames = " ".join(c["username"] for c in allowed[: args.limit or len(allowed)])
+        command_preview.append(f"sherlock {usernames} --print-found --timeout 20 --folderoutput <case-sherlock-output>")
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "tool": tool,
+        "candidates": candidates[: args.limit] if args.limit else candidates,
+        "allowed_count": sum(1 for c in candidates if c["allowed"]),
+        "blocked_count": sum(1 for c in candidates if not c["allowed"]),
+        "command_preview": command_preview,
+        "external_actions_performed": False,
+        "executed_sherlock": False,
+        "blocked_paths": [
+            "Do not contact discovered accounts",
+            "Do not treat username match as identity proof",
+            "Do not search private phone/address/relatives",
+            "Do not use --browse to open/contact profiles automatically",
+            "Do not submit tips based only on Sherlock matches",
+        ],
+    }
+    write_json(outdir / "sherlock-plan.json", payload)
+    lines = [
+        f"# Sherlock Username Correlation Plan — {case_id}",
+        "",
+        "- Tool: `sherlock-project/sherlock`",
+        "- Mode: plan only; not executed",
+        "- External actions performed: false",
+        "- Purpose: public username correlation for officially published aliases only",
+        "",
+        "## Candidates",
+        "",
+    ]
+    for c in payload["candidates"]:
+        mark = "ALLOW" if c["allowed"] else "BLOCK"
+        lines.append(f"- **{mark}** `{c['username']}` — {c['reason']} (risk: {c['risk']})")
+    lines += ["", "## Command preview", ""]
+    lines += [f"```bash\n{cmd}\n```" for cmd in command_preview] or ["No allowed usernames."]
+    lines += ["", "## Blocked paths", ""]
+    lines += [f"- {b}" for b in payload["blocked_paths"]]
+    (outdir / "sherlock-plan.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["sherlock_plan"] = str((outdir / "sherlock-plan.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "allowed": payload["allowed_count"],
+        "blocked": payload["blocked_count"],
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+        "executed_sherlock": False,
+    }, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -1512,6 +1611,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("case")
     p.add_argument("--mode", default="research-summary", choices=["research-summary", "potential-tip-review"])
     p.set_defaults(func=cmd_tip_packet)
+
+    p = sub.add_parser("sherlock-plan", help="Plan safe Sherlock username checks for official aliases; does not execute Sherlock")
+    p.add_argument("case")
+    p.add_argument("--allowed-only", action="store_true")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(func=cmd_sherlock_plan)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")

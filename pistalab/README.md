@@ -16,7 +16,8 @@ It is designed for:
 - entity graph + confidence scoring,
 - lead hypothesis generation,
 - traceable research memory,
-- draft-only tip packets for human review.
+- draft-only tip packets for human review,
+- optional Sherlock username-correlation planning for officially published aliases.
 
 ## What this is not
 
