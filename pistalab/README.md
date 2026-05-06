@@ -18,7 +18,8 @@ It is designed for:
 - traceable research memory,
 - draft-only tip packets for human review,
 - optional Sherlock username-correlation planning for officially published aliases,
-- court-record deepening for public/official docket context.
+- court-record deepening for public/official docket context,
+- public docket/case-number candidate finding without PACER/private access.
 
 ## What this is not
 

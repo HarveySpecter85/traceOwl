@@ -1689,6 +1689,178 @@ def cmd_court_deepen(args: argparse.Namespace) -> None:
         "external_actions_performed": False,
     }, indent=2, ensure_ascii=False))
 
+
+def docket_candidate_score(case: dict[str, Any], result: dict[str, str]) -> dict[str, Any]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    haystack = f"{result.get('title','')} {result.get('snippet','')} {result.get('url','')}"
+    score = 0
+    reasons: list[str] = []
+    if name and re.search(re.escape(name), haystack, re.I):
+        score += 30; reasons.append("primary name match")
+    if re.search(r"United States v\.?|case(?:\s+no\.)?|criminal|docket|plea|sentenc|indictment", haystack, re.I):
+        score += 25; reasons.append("docket/court terms")
+    if re.search(r"Central District of California|C\.D\. Cal\.?|CDCA|cacd", haystack, re.I):
+        score += 20; reasons.append("CDCA court/district signal")
+    if re.search(r"\b\d{2}-cr-\d+|\bCR\s*\d{2,}|case\s+no", haystack, re.I):
+        score += 20; reasons.append("case-number-like pattern")
+    domain = source_domain(result.get("url", ""))
+    if domain in {"justice.gov", "cacd.uscourts.gov", "govinfo.gov"} or domain.endswith(".uscourts.gov"):
+        score += 20; reasons.append("official court/government domain")
+    elif domain in {"courtlistener.com", "storage.courtlistener.com", "recap.email"}:
+        score += 15; reasons.append("public RECAP/court mirror domain")
+    elif domain:
+        score += 3; reasons.append("public web source")
+    return {"score": min(score, 100), "reasons": reasons}
+
+
+def docket_finder_queries(case: dict[str, Any], clues: dict[str, Any]) -> list[dict[str, Any]]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    queries: list[dict[str, Any]] = []
+    def add(query: str, purpose: str, risk: str = "low") -> None:
+        queries.append({"query": query, "purpose": purpose, "risk": risk, "allowed": True})
+    add(f'"{name}" "United States v."', "Find case caption")
+    add(f'"{name}" "United States v" "Central District of California"', "Find CDCA case caption")
+    add(f'"{name}" "case no"', "Find public case number references")
+    add(f'"{name}" "criminal complaint"', "Find charging document references")
+    add(f'"{name}" "plea agreement" filetype:pdf', "Find public plea agreement PDFs")
+    add(f'"{name}" "sentencing memorandum"', "Find sentencing filing references")
+    add(f'"{name}" site:cacd.uscourts.gov', "Official CDCA court website")
+    add(f'"{name}" site:govinfo.gov', "Official govinfo court/opinion records")
+    add(f'"{name}" site:storage.courtlistener.com', "Public RECAP document mirror")
+    add(f'"{name}" site:recap.email', "Public RECAP archive")
+    for cn in clues.get("case_numbers") or []:
+        add(f'"{cn}" "{name}"', "Follow extracted case number")
+    return queries
+
+
+def extract_case_number_from_rows(rows: list[dict[str, Any]]) -> list[str]:
+    haystack = "\n".join(f"{r.get('title','')} {r.get('snippet','')} {r.get('url','')}" for r in rows)
+    patterns = [
+        r"\b\d{2}-cr-\d{3,6}(?:-[A-Z]+)?\b",
+        r"\b\d{2,4}-CR-\d{3,6}(?:-[A-Z]+)?\b",
+        r"\bCR\s*\d{2,4}[-:]?\d{3,6}\b",
+        r"Case\s+No\.?\s*[:#]?\s*[A-Z0-9:.-]+",
+    ]
+    nums: set[str] = set()
+    for pat in patterns:
+        for m in re.findall(pat, haystack, re.I):
+            nums.add(re.sub(r"\s+", " ", m).strip())
+    return sorted(nums)
+
+
+def cmd_docket_find(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    ledger_path = Path(args.ledger) if args.ledger else EVIDENCE / case_id / "captures" / "evidence-ledger.jsonl"
+    ledger_rows = read_jsonl(ledger_path)
+    clues = extract_court_clues(case, ledger_rows)
+    queries = docket_finder_queries(case, clues)
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "docket-finder"
+    outdir.mkdir(parents=True, exist_ok=True)
+    trace_dir = EVIDENCE / case_id / "docket-finder"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_ledger = trace_dir / "docket-finder-ledger.jsonl"
+    rows: list[dict[str, Any]] = []
+    queries_run = 0
+    for q in queries:
+        queries_run += 1
+        results = ddg_search(q["query"], limit=args.per_query)
+        if not results:
+            row = {"case_id": case_id, "kind": "docket_search_no_results", "query": q["query"], "captured_at": now_iso(), "external_actions_performed": False}
+            append_jsonl(trace_ledger, row); rows.append(row)
+        for rank, result in enumerate(results, 1):
+            if result.get("title") == "SEARCH_ERROR":
+                row = {"case_id": case_id, "kind": "docket_search_error", "query": q["query"], "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False}
+                append_jsonl(trace_ledger, row); rows.append(row); continue
+            score = docket_candidate_score(case, result)
+            row = {
+                "case_id": case_id,
+                "kind": "docket_candidate",
+                "query": q["query"],
+                "query_purpose": q["purpose"],
+                "rank": rank,
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "domain": source_domain(result.get("url", "")),
+                "snippet": redact_sensitive_lines(result.get("snippet", "")),
+                "captured_at": now_iso(),
+                "official_domain": is_official_domain(result.get("url", "")) or source_domain(result.get("url", "")).endswith("uscourts.gov"),
+                "docket_candidate_score": score["score"],
+                "docket_reasons": score["reasons"],
+                "external_actions_performed": False,
+                "policy": "docket finder: public/official sources only; no PACER/private/sealed access",
+            }
+            append_jsonl(trace_ledger, row)
+            rows.append(row)
+        time.sleep(args.delay)
+    candidates = [r for r in rows if r.get("kind") == "docket_candidate"]
+    candidates.sort(key=lambda r: r.get("docket_candidate_score", 0), reverse=True)
+    case_numbers = sorted(set((clues.get("case_numbers") or []) + extract_case_number_from_rows(candidates)))
+    top_score = candidates[0].get("docket_candidate_score", 0) if candidates else 0
+    if case_numbers and top_score >= args.threshold:
+        status = "DOCKET_CANDIDATE_FOUND"
+    elif candidates and top_score >= args.threshold:
+        status = "HIGH_CONFIDENCE_DOCKET_PATH_NO_NUMBER"
+    elif candidates:
+        status = "LOW_CONFIDENCE_DOCKET_CANDIDATES"
+    else:
+        status = "NO_DOCKET_CANDIDATE_FOUND"
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "threshold": args.threshold,
+        "queries_run": queries_run,
+        "candidate_count": len(candidates),
+        "case_numbers": case_numbers,
+        "top_candidates": candidates[: args.report_limit],
+        "trace_ledger": str(trace_ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "blocked_paths": [
+            "Do not use PACER credentials or paid/private docket databases in this worker",
+            "Do not access sealed filings",
+            "Do not contact court staff, victims, witnesses, defendants, relatives, employers, or associates",
+            "Do not submit tips based only on docket candidates",
+        ],
+    }
+    write_json(outdir / "docket-finder.json", payload)
+    lines = [
+        f"# Court Docket Finder — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Status: {status}",
+        f"- Queries run: {queries_run}",
+        f"- Candidate count: {len(candidates)}",
+        f"- Case numbers: {', '.join(case_numbers) or 'none'}",
+        "- External actions performed: false", "",
+        "## Top candidates", "",
+    ]
+    for c in payload["top_candidates"]:
+        lines += [
+            f"### {c.get('docket_candidate_score')} — {c.get('title') or c.get('url')}",
+            f"- URL: {c.get('url')}",
+            f"- Domain: {c.get('domain')}",
+            f"- Query: `{c.get('query')}`",
+            f"- Reasons: {', '.join(c.get('docket_reasons') or [])}",
+            f"- Snippet: {c.get('snippet')}", "",
+        ]
+    lines += ["## Blocked paths", ""] + [f"- {b}" for b in payload["blocked_paths"]]
+    (outdir / "docket-finder.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("docket_finder", {})["latest"] = str((outdir / "docket-finder.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "status": status,
+        "queries_run": queries_run,
+        "candidate_count": len(candidates),
+        "case_numbers": case_numbers,
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+    }, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -1834,6 +2006,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--per-query", type=int, default=4)
     p.add_argument("--delay", type=float, default=0.5)
     p.set_defaults(func=cmd_court_deepen)
+
+    p = sub.add_parser("docket-find", help="Find public docket/case-number candidates without PACER/private/sealed access")
+    p.add_argument("case")
+    p.add_argument("--ledger", default="")
+    p.add_argument("--max-queries", type=int, default=8)
+    p.add_argument("--per-query", type=int, default=4)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--threshold", type=int, default=75)
+    p.add_argument("--report-limit", type=int, default=10)
+    p.set_defaults(func=cmd_docket_find)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
