@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -1996,6 +1997,145 @@ def cmd_source_router(args: argparse.Namespace) -> None:
         "external_actions_performed": False,
     }, indent=2, ensure_ascii=False))
 
+
+def load_sherlock_plan(case: dict[str, Any], explicit_plan: str = "") -> dict[str, Any]:
+    case_id = case["case_id"]
+    plan_path = Path(explicit_plan) if explicit_plan else OUTPUTS / case_id / "sherlock-plan" / "sherlock-plan.json"
+    if not plan_path.exists():
+        raise SystemExit(f"Sherlock plan not found: {plan_path}. Run sherlock-plan first.")
+    return read_json(plan_path)
+
+
+def parse_sherlock_output(text: str, usernames: list[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    current = ""
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        # Sherlock versions vary. Capture lines with URLs and infer username by nearest explicit username or URL path.
+        url_match = re.search(r"https?://\S+", raw)
+        for u in usernames:
+            if re.search(rf"\b{re.escape(u)}\b", raw, re.I):
+                current = u
+                break
+        if url_match:
+            url = url_match.group(0).rstrip(")],.;")
+            username = current or next((u for u in usernames if re.search(re.escape(u), url, re.I)), "unknown")
+            rows.append({
+                "username": username,
+                "url": url,
+                "domain": source_domain(url),
+                "raw_line": raw[:500],
+            })
+    # De-dupe by URL.
+    seen = set()
+    out = []
+    for row in rows:
+        if row["url"] in seen:
+            continue
+        seen.add(row["url"])
+        out.append(row)
+    return out
+
+
+def cmd_sherlock_run(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    plan = load_sherlock_plan(case, args.plan)
+    candidates = [c for c in plan.get("candidates", []) if c.get("allowed")]
+    if args.username:
+        requested = {u.lower() for u in args.username}
+        candidates = [c for c in candidates if c.get("username", "").lower() in requested]
+    if args.limit:
+        candidates = candidates[: args.limit]
+    usernames = [c["username"] for c in candidates]
+    outdir = OUTPUTS / case_id / "sherlock-run"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "sherlock-run"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "sherlock-ledger.jsonl"
+    preview = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "mode": "execute" if args.execute else "preview",
+        "usernames": usernames,
+        "allowed_candidates": len(usernames),
+        "external_actions_performed": False,
+        "executed_sherlock": False,
+        "gate_required": "--execute --confirm SHERLOCK_PUBLIC_ALIAS_CHECK",
+        "policy": "Only officially published aliases/name variants. Correlation only. No contact/browse/submission.",
+        "blocked_paths": [
+            "Do not contact discovered accounts",
+            "Do not use --browse",
+            "Do not treat a username match as identity proof",
+            "Do not search phone/address/relatives",
+            "Do not submit tips based only on Sherlock matches",
+        ],
+    }
+    write_json(outdir / "sherlock-run-preview.json", preview)
+    if not usernames:
+        print(json.dumps({**preview, "blocked_reason": "no allowed usernames"}, indent=2, ensure_ascii=False))
+        return
+    if not args.execute:
+        print(json.dumps({**preview, "next": "Rerun with --execute --confirm SHERLOCK_PUBLIC_ALIAS_CHECK to run public username correlation."}, indent=2, ensure_ascii=False))
+        return
+    blockers = []
+    if args.confirm != "SHERLOCK_PUBLIC_ALIAS_CHECK":
+        blockers.append("missing --confirm SHERLOCK_PUBLIC_ALIAS_CHECK")
+    sherlock_bin = shutil.which("sherlock")
+    if not sherlock_bin:
+        blockers.append("sherlock executable not found; install sherlock-project in an isolated environment")
+    if args.browse:
+        blockers.append("--browse is prohibited by PistaLab policy")
+    if blockers:
+        result = {**preview, "blocked_reason": "; ".join(blockers)}
+        write_json(outdir / "sherlock-run-result.json", result)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    cmd = [sherlock_bin, *usernames, "--print-found", "--timeout", str(args.timeout), "--folderoutput", str(outdir / "raw")]
+    if args.site:
+        for site in args.site:
+            cmd.extend(["--site", site])
+    started = now_iso()
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=args.process_timeout)
+    raw_stdout = proc.stdout or ""
+    raw_stderr = proc.stderr or ""
+    (outdir / "sherlock-stdout.txt").write_text(raw_stdout)
+    (outdir / "sherlock-stderr.txt").write_text(raw_stderr)
+    matches = parse_sherlock_output(raw_stdout + "\n" + raw_stderr, usernames)
+    for match in matches:
+        row = {
+            "case_id": case_id,
+            "kind": "sherlock_username_match_weak",
+            "username": match["username"],
+            "url": match["url"],
+            "domain": match["domain"],
+            "captured_at": now_iso(),
+            "tool": "sherlock-project/sherlock",
+            "confidence": "weak_correlation_only",
+            "requires_corroboration": True,
+            "external_actions_performed": False,
+            "policy": "Do not contact. Do not accuse. Do not submit based only on this match.",
+        }
+        append_jsonl(ledger, row)
+    result = {
+        **preview,
+        "executed_sherlock": True,
+        "started_at": started,
+        "completed_at": now_iso(),
+        "returncode": proc.returncode,
+        "match_count": len(matches),
+        "ledger": str(ledger.relative_to(ROOT)),
+        "stdout": str((outdir / "sherlock-stdout.txt").relative_to(ROOT)),
+        "stderr": str((outdir / "sherlock-stderr.txt").relative_to(ROOT)),
+        "external_actions_performed": False,
+    }
+    write_json(outdir / "sherlock-run-result.json", result)
+    case.setdefault("tools", {})["sherlock_run"] = str((outdir / "sherlock-run-result.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -2161,6 +2301,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--probe-limit", type=int, default=5)
     p.add_argument("--delay", type=float, default=0.5)
     p.set_defaults(func=cmd_source_router)
+
+    p = sub.add_parser("sherlock-run", help="Gated Sherlock username correlation runner; preview by default")
+    p.add_argument("case")
+    p.add_argument("--plan", default="")
+    p.add_argument("--username", action="append", default=[])
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--site", action="append", default=[])
+    p.add_argument("--timeout", type=int, default=20)
+    p.add_argument("--process-timeout", type=int, default=600)
+    p.add_argument("--execute", action="store_true")
+    p.add_argument("--confirm", default="")
+    p.add_argument("--browse", action="store_true", help="Prohibited; present only to block unsafe attempts")
+    p.set_defaults(func=cmd_sherlock_run)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
