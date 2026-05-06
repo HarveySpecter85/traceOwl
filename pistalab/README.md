@@ -26,7 +26,8 @@ It is designed for:
 - public/official camera-source routing and snippet-only search with unsafe camera discovery blocked,
 - route runner for ready public routes with excerpts, hashes, deltas, and review scoring,
 - review extractor for actionable/monitor/parking-lot signal decisions,
-- beyond-official public OSINT routing/search/extraction for non-government source handles.
+- beyond-official public OSINT routing/search/extraction for non-government source handles,
+- HTML living reports for summaries, artifacts, and actionables.
 
 ## What this is not
 

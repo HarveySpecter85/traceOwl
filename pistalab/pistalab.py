@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -3418,6 +3419,20 @@ def cmd_beyond_derived_search(args: argparse.Namespace) -> None:
     save_case(case)
     print(json.dumps({"case_id": case_id, "status": status, "queries_run": len(queries), "result_count": len(result_rows), "a_count": len(a), "b_count": len(b), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
 
+
+def cmd_html_report(args: argparse.Namespace) -> None:
+    script = ROOT / "scripts" / "html_report.py"
+    cmd = [sys.executable, str(script), args.case]
+    if args.output:
+        cmd.extend(["--output", args.output])
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    if proc.returncode:
+        raise SystemExit(proc.returncode)
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -3683,6 +3698,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--delay", type=float, default=0.5)
     p.add_argument("--limit", type=int, default=25)
     p.set_defaults(func=cmd_beyond_derived_search)
+
+    p = sub.add_parser("html-report", help="Generate/update living HTML case report")
+    p.add_argument("case")
+    p.add_argument("--output", default="")
+    p.set_defaults(func=cmd_html_report)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
