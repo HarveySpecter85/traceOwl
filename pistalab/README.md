@@ -24,7 +24,8 @@ It is designed for:
 - gated Sherlock execution for weak username-correlation evidence,
 - Sherlock result triage and search-snippet corroboration,
 - public/official camera-source routing and snippet-only search with unsafe camera discovery blocked,
-- route runner for ready public routes with excerpts, hashes, deltas, and review scoring.
+- route runner for ready public routes with excerpts, hashes, deltas, and review scoring,
+- review extractor for actionable/monitor/parking-lot signal decisions.
 
 ## What this is not
 

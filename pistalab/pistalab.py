@@ -2820,6 +2820,174 @@ def cmd_route_runner(args: argparse.Namespace) -> None:
     save_case(case)
     print(json.dumps({"case_id": case_id, "status": status, "routes_run": len(rows), "changed_count": len(changed), "review_count": len(review), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
 
+
+def route_review_signal(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    aliases = entity.get("aliases") or []
+    text = " ".join(str(row.get(k, "")) for k in ["label", "original_url", "materialized_url", "excerpt", "reason"])
+    hits: dict[str, list[str]] = {
+        "primary_name": [],
+        "aliases": [],
+        "reward_status": [],
+        "court_docket": [],
+        "case_status": [],
+        "financial_crime": [],
+        "law_enforcement": [],
+        "camera_context": [],
+        "blocking_shell": [],
+    }
+    if name and re.search(re.escape(name), text, re.I):
+        hits["primary_name"].append(name)
+    for alias in aliases:
+        if alias and len(alias) > 2 and re.search(re.escape(alias), text, re.I):
+            hits["aliases"].append(alias)
+    patterns = {
+        "reward_status": [r"reward", r"wanted", r"fugitive", r"tip", r"MostWanted", r"USSSMostWanted"],
+        "court_docket": [r"case\s+no", r"docket", r"United States v", r"plea", r"sentenc", r"indict", r"forfeiture", r"Central District of California", r"CDCA"],
+        "case_status": [r"arrested", r"captured", r"abscond", r"ankle", r"monitor", r"sentenced", r"in absentia", r"extradit"],
+        "financial_crime": [r"money laundering", r"cryptocurrency", r"crypto", r"wire transfer", r"shell compan", r"victim funds", r"scam center", r"pig butchering"],
+        "law_enforcement": [r"Secret Service", r"USSS", r"Justice Department", r"Department of State", r"U\.S\. Marshals", r"Homeland Security", r"HSI"],
+        "camera_context": [r"camera", r"webcam", r"CCTV", r"traffic cam", r"livecam", r"surveillance"],
+        "blocking_shell": [r"Technical Difficulties", r"Exception:\s*forbidden", r"HTTP Error 403", r"DuckDuckGo All Regions", r"Please click here if you are not redirected"],
+    }
+    for bucket, pats in patterns.items():
+        for pat in pats:
+            if re.search(pat, text, re.I):
+                hits[bucket].append(pat)
+    score = 0
+    reasons: list[str] = []
+    if hits["primary_name"]:
+        score += 30; reasons.append("primary name present")
+    if hits["aliases"]:
+        score += min(20, 8 * len(set(hits["aliases"]))); reasons.append("alias present")
+    if hits["reward_status"]:
+        score += 15; reasons.append("reward/wanted/tip status terms")
+    if hits["court_docket"]:
+        score += 25; reasons.append("court/docket terms")
+    if hits["case_status"]:
+        score += 20; reasons.append("case status terms")
+    if hits["financial_crime"]:
+        score += 15; reasons.append("financial-crime terms")
+    if hits["law_enforcement"]:
+        score += 10; reasons.append("law-enforcement terms")
+    if hits["camera_context"] and row.get("route_kind") == "public_camera":
+        score += 3; reasons.append("camera source context only")
+    if hits["blocking_shell"]:
+        score -= 35; reasons.append("blocking/search shell, not substantive content")
+    if row.get("changed_since_previous"):
+        score += 20; reasons.append("route hash changed")
+    if row.get("route_kind") == "public_camera" and not hits["primary_name"]:
+        score -= 15; reasons.append("camera route without case identity signal")
+    score = max(0, min(100, score))
+    if score >= 75:
+        verdict = "ACTIONABLE_REVIEW_SIGNAL"
+    elif score >= 45:
+        verdict = "MONITOR_SIGNAL"
+    else:
+        verdict = "PARK_LOW_SIGNAL"
+    return {"review_score": score, "review_verdict": verdict, "review_reasons": reasons, "hits": {k: sorted(set(v)) for k, v in hits.items() if v}}
+
+
+def cmd_review_extractor(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    route_path = Path(args.route_run) if args.route_run else OUTPUTS / case_id / "route-runner" / "route-runner.json"
+    if not route_path.exists():
+        raise SystemExit(f"Route runner output not found: {route_path}. Run route-runner first.")
+    route_run = read_json(route_path)
+    captures = route_run.get("captures", [])
+    if args.min_route_score:
+        captures = [r for r in captures if int(r.get("route_score") or 0) >= args.min_route_score]
+    if args.tiers:
+        wanted = {t.strip() for t in args.tiers.split(",") if t.strip()}
+        captures = [r for r in captures if r.get("route_tier") in wanted]
+    extracted: list[dict[str, Any]] = []
+    for row in captures:
+        sig = route_review_signal(case, row)
+        extracted.append({
+            "route_id": row.get("route_id"),
+            "route_kind": row.get("route_kind"),
+            "route_tier": row.get("route_tier"),
+            "route_score": row.get("route_score"),
+            "label": row.get("label"),
+            "url": row.get("materialized_url") or row.get("original_url"),
+            "fetched": row.get("fetched"),
+            "http_status": row.get("http_status"),
+            "changed_since_previous": row.get("changed_since_previous"),
+            "excerpt_sha256": row.get("excerpt_sha256"),
+            "excerpt_preview": str(row.get("excerpt") or row.get("reason") or "")[: args.preview_chars],
+            **sig,
+        })
+    extracted.sort(key=lambda r: (r.get("review_score", 0), r.get("route_score", 0)), reverse=True)
+    actionable = [r for r in extracted if r.get("review_verdict") == "ACTIONABLE_REVIEW_SIGNAL"]
+    monitor = [r for r in extracted if r.get("review_verdict") == "MONITOR_SIGNAL"]
+    if actionable:
+        status = "ACTIONABLE_REVIEW_SIGNALS_FOUND"
+    elif monitor:
+        status = "MONITOR_SIGNALS_FOUND"
+    else:
+        status = "NO_ACTIONABLE_REVIEW_SIGNALS"
+    outdir = OUTPUTS / case_id / "review-extractor"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "review-extractor"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "review-extractor-ledger.jsonl"
+    for row in extracted:
+        append_jsonl(ledger, {"case_id": case_id, "kind": "route_review_extraction", "captured_at": now_iso(), "external_actions_performed": False, **row})
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "input_route_run": str(route_path.relative_to(ROOT)) if route_path.is_relative_to(ROOT) else str(route_path),
+        "reviewed_count": len(extracted),
+        "actionable_count": len(actionable),
+        "monitor_count": len(monitor),
+        "top_signals": extracted[: args.limit],
+        "ledger": str(ledger.relative_to(ROOT)),
+        "refresh_recommended": bool(actionable),
+        "external_actions_performed": False,
+        "policy": "Review extraction only. No external contact, no private sources, no submissions.",
+    }
+    write_json(outdir / "review-extractor.json", payload)
+    lines = [
+        f"# Review Extractor — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Status: {status}",
+        f"- Reviewed routes: {len(extracted)}",
+        f"- Actionable: {len(actionable)}",
+        f"- Monitor: {len(monitor)}",
+        f"- Refresh recommended: {payload['refresh_recommended']}",
+        "- External actions performed: false", "",
+        "## Top signals", "",
+    ]
+    for r in payload["top_signals"]:
+        lines += [
+            f"### {r.get('review_score')} — {r.get('review_verdict')} — {r.get('label')}",
+            f"- Route: `{r.get('route_id')}` / `{r.get('route_kind')}` / route tier `{r.get('route_tier')}`",
+            f"- URL: {r.get('url')}",
+            f"- Changed: {r.get('changed_since_previous')} / HTTP: {r.get('http_status', 'n/a')}",
+            f"- Reasons: {', '.join(r.get('review_reasons') or []) or 'none'}",
+            f"- Hits: `{json.dumps(r.get('hits') or {}, ensure_ascii=False)[:600]}`",
+            f"- Preview: {r.get('excerpt_preview')}", "",
+        ]
+    lines += ["## Decision", ""]
+    if actionable:
+        lines.append("- Actionable signals found. Refresh graph/hypotheses and draft review note before any external action.")
+    elif monitor:
+        lines.append("- Monitor-only signals found. Keep route runner active; no tip/update yet.")
+    else:
+        lines.append("- No actionable review signal. Keep as baseline/monitoring evidence.")
+    lines += ["", "## Policy", "", "- No contact.", "- No private/paid sources.", "- No tip submission."]
+    (outdir / "review-extractor.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["review_extractor"] = str((outdir / "review-extractor.json").relative_to(ROOT))
+    save_case(case)
+    if args.refresh and actionable:
+        # Re-run graph/hypotheses on canonical evidence; review extractor itself remains non-mutating beyond case tool pointer.
+        cmd_graph_score(argparse.Namespace(case=args.case, ledger=""))
+        cmd_hypotheses(argparse.Namespace(case=args.case, ledger="", score="", limit=0))
+    print(json.dumps({"case_id": case_id, "status": status, "reviewed_count": len(extracted), "actionable_count": len(actionable), "monitor_count": len(monitor), "refresh_recommended": bool(actionable), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -3042,6 +3210,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ensure-routers", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_route_runner)
+
+    p = sub.add_parser("review-extractor", help="Extract actionable/monitor signals from route-runner captures")
+    p.add_argument("case")
+    p.add_argument("--route-run", default="")
+    p.add_argument("--min-route-score", type=int, default=0)
+    p.add_argument("--tiers", default="A_REVIEW_NOW,B_KEEP_MONITORING")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--preview-chars", type=int, default=500)
+    p.add_argument("--refresh", action="store_true", help="Refresh graph/hypotheses only if actionable signals are found")
+    p.set_defaults(func=cmd_review_extractor)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
