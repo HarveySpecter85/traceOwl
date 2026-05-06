@@ -23,7 +23,8 @@ It is designed for:
 - public-record source routing with explicit ready/blocked states,
 - gated Sherlock execution for weak username-correlation evidence,
 - Sherlock result triage and search-snippet corroboration,
-- public/official camera-source routing and snippet-only search with unsafe camera discovery blocked.
+- public/official camera-source routing and snippet-only search with unsafe camera discovery blocked,
+- route runner for ready public routes with excerpts, hashes, deltas, and review scoring.
 
 ## What this is not
 

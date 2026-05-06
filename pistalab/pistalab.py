@@ -2644,6 +2644,182 @@ def cmd_camera_search(args: argparse.Namespace) -> None:
     save_case(case)
     print(json.dumps({"case_id": case_id, "status": status, "queries_run": len(queries), "result_count": len(result_rows), "strong_count": len(strong), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
 
+
+def route_runner_load_routes(case: dict[str, Any], include_camera: bool = True) -> list[dict[str, Any]]:
+    case_id = case["case_id"]
+    routes: list[dict[str, Any]] = []
+    source_path = OUTPUTS / case_id / "source-router" / "public-records-source-router.json"
+    if source_path.exists():
+        for r in read_json(source_path).get("routes", []):
+            if r.get("allowed") and r.get("status") == "ready":
+                routes.append({**r, "router": "source-router", "route_kind": "public_record"})
+    if include_camera:
+        camera_path = OUTPUTS / case_id / "camera-router" / "camera-router.json"
+        if camera_path.exists():
+            for r in read_json(camera_path).get("routes", []):
+                if r.get("allowed") and str(r.get("status", "")).startswith("ready"):
+                    routes.append({**r, "router": "camera-router", "route_kind": "public_camera"})
+    routes.sort(key=lambda r: r.get("priority", 0), reverse=True)
+    return routes
+
+
+def route_runner_materialize_url(route: dict[str, Any], case: dict[str, Any]) -> tuple[str, str]:
+    """Return (url, materialization_note). route:// entries become safe search URLs, not device/protected access."""
+    url = route.get("url", "")
+    if url.startswith("http://") or url.startswith("https://"):
+        return url, "direct_public_url"
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    anchors = route.get("anchors") or case_camera_terms(case).get("anchors") or []
+    anchor = anchors[0] if anchors else name
+    label = route.get("label", "public source")
+    if url.startswith("route://"):
+        query = f'{anchor} {label} official public'
+        return "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query), "route_pointer_materialized_as_public_search"
+    return "", "unsupported_or_blocked_route_url"
+
+
+def route_runner_previous_hashes(ledger: Path) -> dict[str, str]:
+    rows = read_jsonl(ledger) if ledger.exists() else []
+    latest: dict[str, str] = {}
+    for r in rows:
+        rid = r.get("route_id") or r.get("source_id")
+        h = r.get("excerpt_sha256") or r.get("response_sha256")
+        if rid and h:
+            latest[rid] = h
+    return latest
+
+
+def route_runner_score(route: dict[str, Any], fetch: dict[str, Any]) -> dict[str, Any]:
+    score = 0
+    reasons: list[str] = []
+    excerpt = str(fetch.get("excerpt") or fetch.get("reason") or "")
+    if fetch.get("fetched"):
+        score += 25; reasons.append("public fetch succeeded")
+    status = fetch.get("http_status")
+    if isinstance(status, int) and 200 <= status < 300:
+        score += 20; reasons.append("2xx HTTP status")
+    elif isinstance(status, int) and status in {401, 403, 429}:
+        score -= 10; reasons.append(f"blocked/rate-limited status {status}")
+    if route.get("route_kind") == "public_record":
+        score += 20; reasons.append("public record route")
+    if route.get("route_kind") == "public_camera":
+        score += 5; reasons.append("camera route: source lead only")
+    if route.get("official_domain") or source_domain(route.get("url", "")).endswith(".gov"):
+        score += 20; reasons.append("official/government source")
+    if fetch.get("changed_since_previous"):
+        score += 20; reasons.append("content hash changed")
+    if fetch.get("first_seen_route"):
+        reasons.append("first route capture baseline")
+    if fetch.get("materialization_note") == "route_pointer_materialized_as_public_search":
+        score -= 5; reasons.append("route pointer materialized as search")
+    if re.search(r"Technical Difficulties|Exception:\s*forbidden|HTTP Error 403|Please click here if you are not redirected|DuckDuckGo All Regions", excerpt, re.I):
+        score -= 35; reasons.append("fetch returned blocking/search shell, not useful content")
+    score = max(0, min(100, score))
+    if score >= 75:
+        tier = "A_REVIEW_NOW"
+    elif score >= 45:
+        tier = "B_KEEP_MONITORING"
+    else:
+        tier = "C_LOW_SIGNAL"
+    return {"route_score": score, "route_tier": tier, "route_score_reasons": reasons}
+
+
+def cmd_route_runner(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    if args.ensure_routers:
+        if not (OUTPUTS / case_id / "source-router" / "public-records-source-router.json").exists():
+            cmd_source_router(argparse.Namespace(case=args.case, ledger="", ready_only=False, limit=0, probe=False, probe_limit=0, delay=0.0))
+        if args.include_camera and not (OUTPUTS / case_id / "camera-router" / "camera-router.json").exists():
+            cmd_camera_router(argparse.Namespace(case=args.case))
+    routes = route_runner_load_routes(case, include_camera=args.include_camera)
+    if args.kind != "all":
+        routes = [r for r in routes if r.get("route_kind") == args.kind]
+    if args.limit:
+        routes = routes[: args.limit]
+    outdir = OUTPUTS / case_id / "route-runner"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "route-runner"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "route-runner-ledger.jsonl"
+    prev_hashes = route_runner_previous_hashes(ledger)
+    rows: list[dict[str, Any]] = []
+    for route in routes:
+        route_id = route.get("source_id") or slugify(route.get("label", "route"))
+        url, note = route_runner_materialize_url(route, case)
+        if not url:
+            fetch = {"fetched": False, "reason": note, "materialization_note": note, "external_actions_performed": False}
+        elif args.dry_run:
+            fetch = {"fetched": False, "reason": "dry_run", "materialized_url": url, "materialization_note": note, "external_actions_performed": False}
+        else:
+            fetch = safe_fetch_excerpt(url, max_chars=args.excerpt_chars)
+            fetch["materialized_url"] = url
+            fetch["materialization_note"] = note
+        h = fetch.get("excerpt_sha256")
+        fetch["changed_since_previous"] = bool(h and prev_hashes.get(route_id) and prev_hashes.get(route_id) != h)
+        fetch["first_seen_route"] = bool(h and route_id not in prev_hashes)
+        score = route_runner_score(route, fetch)
+        row = {
+            "case_id": case_id,
+            "kind": "route_runner_capture",
+            "route_id": route_id,
+            "route_kind": route.get("route_kind"),
+            "router": route.get("router"),
+            "label": route.get("label"),
+            "source_type": route.get("source_type") or route.get("access"),
+            "original_url": route.get("url"),
+            "captured_at": now_iso(),
+            "external_actions_performed": False,
+            "policy": "Public ready routes only. No private/paid/sealed/open-IP-camera access; no contact/submission.",
+            **fetch,
+            **score,
+        }
+        append_jsonl(ledger, row)
+        rows.append(row)
+        time.sleep(args.delay)
+    changed = [r for r in rows if r.get("changed_since_previous")]
+    review = [r for r in rows if r.get("route_tier") == "A_REVIEW_NOW"]
+    status = "ROUTE_CHANGES_FOUND_REVIEW_REQUIRED" if changed else ("ROUTES_CAPTURED_REVIEW_AVAILABLE" if rows else "NO_READY_ROUTES")
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "routes_run": len(rows),
+        "changed_count": len(changed),
+        "review_count": len(review),
+        "captures": rows,
+        "ledger": str(ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "policy": "Only ready public routes are run. No private/paid/sealed/open-camera-device access; no contact or submissions.",
+    }
+    write_json(outdir / "route-runner.json", payload)
+    lines = [
+        f"# Route Runner — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Status: {status}",
+        f"- Routes run: {len(rows)}",
+        f"- Changed: {len(changed)}",
+        f"- A-review routes: {len(review)}",
+        "- External actions performed: false", "",
+        "## Captures", "",
+    ]
+    for r in rows[: args.report_limit]:
+        lines += [
+            f"### {r.get('route_score')} — {r.get('route_tier')} — {r.get('label')}",
+            f"- Route: `{r.get('route_id')}` / `{r.get('route_kind')}`",
+            f"- URL: {r.get('materialized_url') or r.get('original_url')}",
+            f"- Fetched: {r.get('fetched')} / HTTP: {r.get('http_status', 'n/a')}",
+            f"- First seen: {r.get('first_seen_route')} / Changed: {r.get('changed_since_previous')}",
+            f"- Reasons: {', '.join(r.get('route_score_reasons') or [])}",
+            f"- Excerpt preview: {str(r.get('excerpt', r.get('reason', '')))[:500]}", "",
+        ]
+    lines += ["## Policy", "", "- No private or paid sources.", "- No sealed filings.", "- No open IP/misconfigured camera discovery.", "- No face recognition/tracking.", "- No contact.", "- No tip submission."]
+    (outdir / "route-runner.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["route_runner"] = str((outdir / "route-runner.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({"case_id": case_id, "status": status, "routes_run": len(rows), "changed_count": len(changed), "review_count": len(review), "outdir": str(outdir), "external_actions_performed": False}, indent=2, ensure_ascii=False))
+
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
     fields = extract_notice_fields(text)
@@ -2854,6 +3030,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold", type=int, default=70)
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_camera_search)
+
+    p = sub.add_parser("route-runner", help="Run ready public source/camera routes, capture excerpts/hashes, detect deltas")
+    p.add_argument("case")
+    p.add_argument("--kind", default="all", choices=["all", "public_record", "public_camera"])
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--excerpt-chars", type=int, default=2500)
+    p.add_argument("--report-limit", type=int, default=25)
+    p.add_argument("--include-camera", action="store_true")
+    p.add_argument("--ensure-routers", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_route_runner)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
