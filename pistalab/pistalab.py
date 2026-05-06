@@ -2083,7 +2083,8 @@ def cmd_sherlock_run(args: argparse.Namespace) -> None:
     blockers = []
     if args.confirm != "SHERLOCK_PUBLIC_ALIAS_CHECK":
         blockers.append("missing --confirm SHERLOCK_PUBLIC_ALIAS_CHECK")
-    sherlock_bin = shutil.which("sherlock")
+    bundled_sherlock = ROOT / "tools" / "sherlock-venv" / "bin" / "sherlock"
+    sherlock_bin = shutil.which("sherlock") or (str(bundled_sherlock) if bundled_sherlock.exists() else "")
     if not sherlock_bin:
         blockers.append("sherlock executable not found; install sherlock-project in an isolated environment")
     if args.browse:
@@ -2135,6 +2136,261 @@ def cmd_sherlock_run(args: argparse.Namespace) -> None:
     case.setdefault("tools", {})["sherlock_run"] = str((outdir / "sherlock-run-result.json").relative_to(ROOT))
     save_case(case)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+LOW_VALUE_SHERLOCK_DOMAINS = {
+    "archiveofourown.org", "audiojungle.net", "chess.com", "duolingo.com", "flipboard.com",
+    "flickr.com", "freelancer.com", "steamcommunity.com", "xboxgamertag.com",
+    "deviantart.com", "pinterest.com", "disqus.com", "codecademy.com", "codeforces.com",
+    "crowdin.com", "dribbble.com", "fosstodon.org", "gallog.dcinside.com", "periscope.tv",
+    "replit.com", "trello.com", "tradingview.com", "clubhouse.com", "clapperapp.com",
+}
+
+HIGH_SIGNAL_SHERLOCK_DOMAINS = {
+    "github.com", "t.me", "telegram.me", "youtube.com", "tiktok.com", "cash.app",
+    "account.venmo.com", "medium.com", "about.me", "bsky.app", "behance.net", "carrd.co",
+    "carbonmade.com", "linkedin.com", "x.com", "twitter.com", "facebook.com", "instagram.com",
+}
+
+
+def sherlock_username_rarity(username: str, plan: dict[str, Any]) -> str:
+    for c in plan.get("candidates", []):
+        if c.get("username", "").lower() == username.lower():
+            raw = " ".join(str(x) for x in [c.get("risk", ""), c.get("notes", ""), c.get("reason", ""), c.get("source", "")])
+            if re.search(r"short|common|generic|false", raw, re.I):
+                return "generic_or_high_false_positive"
+            if len(username) <= 5 or re.fullmatch(r"[A-Za-z]+Li", username):
+                return "generic_or_high_false_positive"
+            if re.search(r"alias|official|notice|published", raw, re.I):
+                return "official_alias"
+    if len(username) <= 5 or re.fullmatch(r"[A-Za-z]+Li", username):
+        return "generic_or_high_false_positive"
+    if re.search(r"perfect|kg|crypto|wallet", username, re.I):
+        return "distinctive_alias"
+    return "unknown"
+
+
+def sherlock_triage_score(row: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    username = row.get("username", "")
+    domain = row.get("domain", "")
+    url = row.get("url", "")
+    score = 0
+    reasons: list[str] = []
+    rarity = sherlock_username_rarity(username, plan)
+    if rarity in {"official_alias", "distinctive_alias"}:
+        score += 35; reasons.append(rarity)
+    elif rarity == "generic_or_high_false_positive":
+        score -= 25; reasons.append("generic/high false-positive username")
+    else:
+        score += 5; reasons.append("unknown rarity")
+    if domain in HIGH_SIGNAL_SHERLOCK_DOMAINS or any(domain.endswith("." + d) for d in HIGH_SIGNAL_SHERLOCK_DOMAINS):
+        score += 25; reasons.append("higher-signal platform")
+    if domain in LOW_VALUE_SHERLOCK_DOMAINS or any(domain.endswith("." + d) for d in LOW_VALUE_SHERLOCK_DOMAINS):
+        score -= 15; reasons.append("low-value/generic platform")
+    if re.search(r"cash\.app|venmo|wallet|crypto|telegram|t\.me|github|youtube|tiktok", url, re.I):
+        score += 10; reasons.append("finance/comm/dev/social route worth corroborating")
+    if re.search(r"xuanli|darenli", username, re.I):
+        score -= 15; reasons.append("name-only username collision risk")
+    if re.search(r"kgperfect", username, re.I):
+        score += 20; reasons.append("distinctive alias from plan")
+    score = max(0, min(100, score))
+    if score >= 70:
+        tier = "A_CORROBORATE_FIRST"
+    elif score >= 45:
+        tier = "B_REVIEW_IF_TIME"
+    else:
+        tier = "C_LIKELY_NOISE"
+    return {"score": score, "tier": tier, "reasons": reasons, "rarity": rarity}
+
+
+def cmd_sherlock_triage(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    plan = load_sherlock_plan(case, args.plan)
+    ledger_path = Path(args.ledger) if args.ledger else EVIDENCE / case_id / "sherlock-run" / "sherlock-ledger.jsonl"
+    rows = read_jsonl(ledger_path)
+    triaged: list[dict[str, Any]] = []
+    for row in rows:
+        scored = sherlock_triage_score(row, plan)
+        triaged.append({**row, **scored})
+    triaged.sort(key=lambda r: (r.get("score", 0), r.get("username", ""), r.get("domain", "")), reverse=True)
+    selected = [r for r in triaged if r.get("score", 0) >= args.threshold]
+    outdir = OUTPUTS / case_id / "sherlock-triage"
+    outdir.mkdir(parents=True, exist_ok=True)
+    by_tier: dict[str, int] = {}
+    by_username: dict[str, int] = {}
+    for r in triaged:
+        by_tier[r["tier"]] = by_tier.get(r["tier"], 0) + 1
+        by_username[r["username"]] = by_username.get(r["username"], 0) + 1
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "input_ledger": str(ledger_path.relative_to(ROOT)) if ledger_path.is_relative_to(ROOT) else str(ledger_path),
+        "total_matches": len(rows),
+        "threshold": args.threshold,
+        "selected_count": len(selected),
+        "by_tier": by_tier,
+        "by_username": by_username,
+        "selected_for_corroboration": selected[: args.limit],
+        "all_triaged": triaged,
+        "external_actions_performed": False,
+        "policy": "Sherlock results are weak correlation only. No contact, no browsing, no accusation, no tip submission.",
+    }
+    write_json(outdir / "sherlock-triage.json", payload)
+    lines = [
+        f"# Sherlock Triage — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Total matches: {len(rows)}",
+        f"- Selected for corroboration: {len(selected)}",
+        f"- External actions performed: false", "",
+        "## Tier counts", "",
+    ]
+    for k, v in sorted(by_tier.items()):
+        lines.append(f"- {k}: {v}")
+    lines += ["", "## Selected for corroboration", ""]
+    for r in selected[: args.limit]:
+        lines += [
+            f"### {r['score']} — {r['tier']} — {r.get('username')} @ {r.get('domain')}",
+            f"- URL: {r.get('url')}",
+            f"- Reasons: {', '.join(r.get('reasons') or [])}",
+            "- Required next step: corroborate against official/case facts before treating as a lead.", "",
+        ]
+    lines += ["## Policy", "", "- Weak correlation only.", "- No contact.", "- No automatic browsing/opening profiles.", "- No tip submission from Sherlock matches alone."]
+    (outdir / "sherlock-triage.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["sherlock_triage"] = str((outdir / "sherlock-triage.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "total_matches": len(rows),
+        "selected_for_corroboration": len(selected),
+        "by_tier": by_tier,
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_sherlock_corroborate(args: argparse.Namespace) -> None:
+    case = read_json(Path(args.case))
+    case_id = case["case_id"]
+    triage_path = Path(args.triage) if args.triage else OUTPUTS / case_id / "sherlock-triage" / "sherlock-triage.json"
+    if not triage_path.exists():
+        raise SystemExit(f"Sherlock triage not found: {triage_path}. Run sherlock-triage first.")
+    triage = read_json(triage_path)
+    selected = triage.get("selected_for_corroboration", [])
+    usernames = sorted({r.get("username") for r in selected if r.get("username")})
+    entity = (case.get("entities") or [{}])[0]
+    name = entity.get("name", "")
+    case_terms = ["Daren Li", "money laundering", "cryptocurrency", "USSS", "Secret Service", "pig butchering", "shell companies"]
+    queries: list[dict[str, str]] = []
+    for username in usernames:
+        queries.extend([
+            {"username": username, "query": f'"{username}" "{name}"', "purpose": "direct case-name corroboration"},
+            {"username": username, "query": f'"{username}" "money laundering"', "purpose": "crime-pattern corroboration"},
+            {"username": username, "query": f'"{username}" cryptocurrency OR crypto', "purpose": "crypto context corroboration"},
+            {"username": username, "query": f'"{username}" "pig butchering"', "purpose": "scam-pattern corroboration"},
+            {"username": username, "query": f'"{username}" "Secret Service" OR USSS', "purpose": "law-enforcement context corroboration"},
+        ])
+    if args.max_queries:
+        queries = queries[: args.max_queries]
+    outdir = OUTPUTS / case_id / "sherlock-corroboration"
+    outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = EVIDENCE / case_id / "sherlock-corroboration"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    ledger = evidence_dir / "sherlock-corroboration-ledger.jsonl"
+    rows: list[dict[str, Any]] = []
+    for q in queries:
+        results = ddg_search(q["query"], limit=args.per_query)
+        if not results:
+            row = {"case_id": case_id, "kind": "sherlock_corroboration_no_results", **q, "captured_at": now_iso(), "external_actions_performed": False}
+            append_jsonl(ledger, row); rows.append(row)
+        for rank, result in enumerate(results, 1):
+            if result.get("title") == "SEARCH_ERROR":
+                row = {"case_id": case_id, "kind": "sherlock_corroboration_error", **q, "error": result.get("snippet"), "captured_at": now_iso(), "external_actions_performed": False}
+                append_jsonl(ledger, row); rows.append(row); continue
+            text = f"{result.get('title','')} {result.get('snippet','')} {result.get('url','')}"
+            hits = []
+            for term in [name, "money laundering", "cryptocurrency", "crypto", "pig butchering", "Secret Service", "USSS", "Daren Li"]:
+                if term and re.search(re.escape(term), text, re.I):
+                    hits.append(term)
+            score = 0
+            if q["username"].lower() in text.lower(): score += 25
+            if name and re.search(re.escape(name), text, re.I): score += 45
+            if any(h in hits for h in ["money laundering", "pig butchering", "Secret Service", "USSS"]): score += 25
+            if any(h in hits for h in ["cryptocurrency", "crypto"]): score += 10
+            row = {
+                "case_id": case_id,
+                "kind": "sherlock_corroboration_search_result",
+                **q,
+                "rank": rank,
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "domain": source_domain(result.get("url", "")),
+                "snippet": redact_sensitive_lines(result.get("snippet", "")),
+                "hits": hits,
+                "corroboration_score": min(score, 100),
+                "captured_at": now_iso(),
+                "external_actions_performed": False,
+                "policy": "Search-snippet corroboration only. No profile opening, no contact, no accusation, no tip submission.",
+            }
+            append_jsonl(ledger, row); rows.append(row)
+        time.sleep(args.delay)
+    result_rows = [r for r in rows if r.get("kind") == "sherlock_corroboration_search_result"]
+    result_rows.sort(key=lambda r: r.get("corroboration_score", 0), reverse=True)
+    strong = [r for r in result_rows if r.get("corroboration_score", 0) >= args.strong_threshold]
+    if strong:
+        status = "CORROBORATION_CANDIDATES_FOUND_REVIEW_REQUIRED"
+    elif result_rows:
+        status = "NO_STRONG_CORROBORATION_SNIPPETS"
+    else:
+        status = "NO_CORROBORATION_RESULTS"
+    payload = {
+        "case_id": case_id,
+        "generated_at": now_iso(),
+        "status": status,
+        "usernames": usernames,
+        "queries_run": len(queries),
+        "result_count": len(result_rows),
+        "strong_count": len(strong),
+        "top_results": result_rows[: args.limit],
+        "ledger": str(ledger.relative_to(ROOT)),
+        "external_actions_performed": False,
+        "policy": "Sherlock corroboration uses search snippets only; profile opening/contact/submission are blocked.",
+    }
+    write_json(outdir / "sherlock-corroboration.json", payload)
+    lines = [
+        f"# Sherlock Corroboration — {case_id}", "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Status: {status}",
+        f"- Usernames: {', '.join(usernames) or 'none'}",
+        f"- Queries run: {len(queries)}",
+        f"- Results: {len(result_rows)}",
+        f"- Strong candidates: {len(strong)}",
+        f"- External actions performed: false", "",
+        "## Top search-snippet results", "",
+    ]
+    for r in payload["top_results"]:
+        lines += [
+            f"### {r.get('corroboration_score')} — {r.get('title') or r.get('url')}",
+            f"- Username: {r.get('username')}",
+            f"- URL: {r.get('url')}",
+            f"- Query: `{r.get('query')}`",
+            f"- Hits: {', '.join(r.get('hits') or []) or 'none'}",
+            f"- Snippet: {r.get('snippet')}", "",
+        ]
+    lines += ["## Policy", "", "- No profile opening.", "- No contact.", "- No accusation.", "- No tip submission from username matches alone."]
+    (outdir / "sherlock-corroboration.md").write_text("\n".join(lines) + "\n")
+    case.setdefault("tools", {})["sherlock_corroboration"] = str((outdir / "sherlock-corroboration.json").relative_to(ROOT))
+    save_case(case)
+    print(json.dumps({
+        "case_id": case_id,
+        "status": status,
+        "usernames": usernames,
+        "queries_run": len(queries),
+        "result_count": len(result_rows),
+        "strong_count": len(strong),
+        "outdir": str(outdir),
+        "external_actions_performed": False,
+    }, indent=2, ensure_ascii=False))
 
 def cmd_intake_text(args: argparse.Namespace) -> None:
     text = args.text or Path(args.file).read_text()
@@ -2314,6 +2570,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm", default="")
     p.add_argument("--browse", action="store_true", help="Prohibited; present only to block unsafe attempts")
     p.set_defaults(func=cmd_sherlock_run)
+
+    p = sub.add_parser("sherlock-triage", help="Triage Sherlock weak username matches into corroboration priorities")
+    p.add_argument("case")
+    p.add_argument("--plan", default="")
+    p.add_argument("--ledger", default="")
+    p.add_argument("--threshold", type=int, default=70)
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=cmd_sherlock_triage)
+
+    p = sub.add_parser("sherlock-corroborate", help="Corroborate triaged Sherlock matches using search snippets only")
+    p.add_argument("case")
+    p.add_argument("--triage", default="")
+    p.add_argument("--max-queries", type=int, default=10)
+    p.add_argument("--per-query", type=int, default=5)
+    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--strong-threshold", type=int, default=70)
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=cmd_sherlock_corroborate)
 
     p = sub.add_parser("validate", help="Validate case readiness for lawful research")
     p.add_argument("case")
